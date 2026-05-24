@@ -245,7 +245,7 @@ function getDefaultData() {
 
     // Account 4 adds:
     conversations: [],
-    joshConversations: [],      // My-Josh chat history (separate from My-Ego)
+    joshConversations: [],      // Tera-Josh chat history (separate from Tera-Ego)
     badges: [],
     level: 1,
     totalTasksCompleted: 0,
@@ -360,7 +360,7 @@ function migrateData(old) {
     merged.totalTasksCompleted = (merged.history || []).filter(h => h.completed).length;
   }
 
-  // My-Josh settings migration
+  // Tera-Josh settings migration
   if (!merged.settings.joshPersonality)               merged.settings.joshPersonality     = 'energetic';
   if (merged.settings.joshAutoEnabled === undefined)   merged.settings.joshAutoEnabled     = false;
   if (!merged.settings.joshAutoMaxPerDay)              merged.settings.joshAutoMaxPerDay   = 3;
@@ -2361,8 +2361,8 @@ ENDING: Warm, genuine 3-4 line motivation — believable, personal, real`;
    He uses same data sources but for motivation.
 ───────────────────────────────────────────── */
 
-const JOSH_ENERGETIC_PROMPT = `Tu "My-Josh" hai — tera ek energetic Hinglish hype man aur reminder system.
-Tu My-Ego nahi hai. Tu woh dost hai jo subah uthake kehta hai "Bhai chal uth, aaj ka din shuru karte hain!"
+const JOSH_ENERGETIC_PROMPT = `Tu "Tera-Josh" hai — tera ek energetic Hinglish hype man aur reminder system.
+Tu Tera-Ego nahi hai. Tu woh dost hai jo subah uthake kehta hai "Bhai chal uth, aaj ka din shuru karte hain!"
 
 TU KAISE BAAT KARTA HAI:
 - Super energetic, warm, encouraging Hinglish
@@ -2382,7 +2382,7 @@ TU YEH KARTA HAI (Reminder + Motivation):
 
 ENDING: 3–4 fire lines in Hinglish. Pure hype. "Tu kar sakta hai, bhai. Chal shuru karte hain."`;
 
-const JOSH_CALM_PROMPT = `Tu "My-Josh" hai — ek calm, grounded Hinglish reminder aur motivator.
+const JOSH_CALM_PROMPT = `Tu "Tera-Josh" hai — ek calm, grounded Hinglish reminder aur motivator.
 Tu gentle energy use karta hai — ek wise dost ki tarah.
 
 TU KAISE BAAT KARTA HAI:
@@ -2394,7 +2394,7 @@ TU KAISE BAAT KARTA HAI:
 
 ENDING: 2–3 calm, confident motivational lines.`;
 
-const JOSH_BEAST_PROMPT = `Tu "My-Josh" hai — ek beast-mode Hinglish reminder.
+const JOSH_BEAST_PROMPT = `Tu "Tera-Josh" hai — ek beast-mode Hinglish reminder.
 Tu hype karta hai brutal energy se — but motivational, not roasting.
 
 TU KAISE BAAT KARTA HAI:
@@ -2463,45 +2463,57 @@ async function runJoshAutoReminder(triggerTime) {
 
   const systemPrompt = getJoshActivePrompt();
   const noTasksNote = context.upcomingTasks.length === 0
-    ? 'Koi upcoming task nahi is time slot mein. General motivation do aur din ke baaki tasks ke liye hype karo.'
+    ? 'Koi upcoming task nahi is time slot mein. User ke life goals aur past performance dekh ke general motivation de aur din ke baaki tasks ke liye hype karo.'
     : '';
 
-  const userContent = `JOSH REMINDER CONTEXT:
-Time: ${triggerTime}
-Upcoming pending tasks in next slot:
-${context.upcomingTasks.map(t =>
-  `- [${t.category}] ${t.name} (${t.priority} priority) | Window: ${t.workingWindow} | Why: ${t.whyMatters}`
-).join('\n') || 'None pending in this slot'}
+  // Build deep context — same data sources as Tera-Ego (category+task name inference, whyMatters, life goals, negative words)
+  const taskLines = context.upcomingTasks.map(t =>
+    `• [${t.category}] "${t.name}" | Priority: ${t.priority} | Window: ${t.workingWindow}\n  Why it matters (user ka likha hua): "${t.whyMatters}"`
+  ).join('\n') || 'None pending in this slot';
 
-Life Goals: ${context.lifeGoals || 'Not set'}
-What others said negatively: ${context.negativeWords || 'Not set'}
-Today's score so far: ${context.daily.score}% (${context.daily.done}/${context.daily.taskCount} tasks done)
+  const userContent = `TERA-JOSH REMINDER — Time: ${triggerTime}
+
+UPCOMING PENDING TASKS (${triggerTime} se agle slot mein):
+${taskLines}
+
+TODAY'S SCORE SO FAR: ${context.daily.score}% (${context.daily.done}/${context.daily.taskCount} tasks done)
+
+LIFE GOALS (user ne khud likhe hain — positively connect karo):
+${context.lifeGoals || 'Not set'}
+
+NEGATIVE WORDS people said (reframe into "prove them wrong" energy):
+${context.negativeWords || 'Not set'}
 
 ${noTasksNote}
 
-Ab reminder + motivation message likhna.
-- Har upcoming task ke liye specifically mention karo (name + category se context infer karo)
-- Life goals se connect karo positively
-- Warm + energetic tone
-- 150–200 words max`;
+INSTRUCTIONS:
+- Category + task name se context strongly infer karo (e.g., PHYSIC > Morning Workout = body transformation)
+- Har task ke liye "why it matters" naturally use karo
+- Life goals se har task ko positively connect karo
+- Negative words ko "prove them wrong" energy mein convert karo
+- Format:
+  Line 1: Ek punchy motivational headline (notification title — max 90 chars, Hinglish, personal)
+  Blank line
+  Full detailed reminder + motivation (har task separately cover karo)`;
 
-  const fullResponse = await callGeminiAPI(systemPrompt, userContent, 500);
+  const fullResponse = await callGeminiAPI(systemPrompt, userContent, 600);
 
   const lines = fullResponse.trim().split('\n').filter(l => l.trim());
-  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Josh: Aaj ke tasks yaad hain? 💪';
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Josh: Aaj ke tasks yaad hain? 💪';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification
+  // Fire notification — title = headline, body = full response
   if ('Notification' in window && Notification.permission === 'granted') {
     const opts = {
-      body: headline,
+      body: notifBody,
       icon: 'icons/icon-192.png',
       tag: 'josh-auto-' + triggerTime,
       renotify: true
     };
     if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => reg.showNotification('💪 Josh — Task Reminder', opts)).catch(() => {});
+      navigator.serviceWorker.ready.then(reg => reg.showNotification(headline, opts)).catch(() => {});
     } else {
-      try { new Notification('💪 Josh — Task Reminder', opts); } catch (e) {}
+      try { new Notification(headline, opts); } catch (e) {}
     }
   }
 
@@ -2513,7 +2525,7 @@ Ab reminder + motivation message likhna.
     triggerTime,
     date: today,
     timestamp: Date.now(),
-    scoreLabel: `💪 Josh Auto — ${context.totalUpcoming} tasks | ${formatTime12(triggerTime)}`,
+    scoreLabel: `💪 Tera-Josh Auto — ${context.totalUpcoming} tasks | ${formatTime12(triggerTime)}`,
     response: fullResponse,
     headline
   });
@@ -2572,7 +2584,7 @@ async function joshManualChat(userMessage, daysCount) {
     return { date: d, score: ds.score, done: ds.done, total: ds.taskCount };
   });
 
-  const systemPrompt = `Tu My-Josh hai — ek caring Hinglish motivator aur analyst.
+  const systemPrompt = `Tu Tera-Josh hai — ek caring Hinglish motivator aur analyst.
 ${getJoshActivePrompt()}
 
 Manual chat mode mein user directly baat kar raha hai.
@@ -2639,7 +2651,7 @@ function renderJoshMessages() {
       <div class="josh-empty">
         <div class="josh-empty-icon">💪</div>
         <h3>Josh Ready Hai!</h3>
-        <p>Josh tera hype man aur reminder hai. Auto mode set karo ya seedha baat karo.</p>
+        <p>Tera-Josh tera hype man aur reminder hai. Auto mode set karo ya seedha baat karo.</p>
       </div>`;
     return;
   }
@@ -2776,8 +2788,27 @@ function updateJoshMaxPerDay(val) {
 }
 
 function updateJoshPrompt(val) {
+  // Staging only — use saveJoshPrompt() to commit
+  appData.settings._joshPromptDraft = val;
+}
+
+function saveJoshPrompt() {
+  const ta = document.getElementById('josh-prompt-textarea');
+  const val = ta ? ta.value.trim() : (appData.settings._joshPromptDraft || '');
   appData.settings.joshPrompt = val;
+  delete appData.settings._joshPromptDraft;
   saveData();
+  showToast('✅ Tera-Josh prompt saved!');
+}
+
+function resetJoshPrompt() {
+  if (!confirm('Tera-Josh ka custom prompt delete karein? Default personality prompt use hoga.')) return;
+  appData.settings.joshPrompt = '';
+  delete appData.settings._joshPromptDraft;
+  saveData();
+  const ta = document.getElementById('josh-prompt-textarea');
+  if (ta) ta.value = '';
+  showToast('↺ Tera-Josh prompt default pe reset hua');
 }
 
 function clearJoshConversations() {
@@ -3282,6 +3313,9 @@ function renderCoachSettings() {
 
   // Profile + badges
   renderProfileSection();
+
+  // Sync weekly/daily report toggles (fixes toggles not reflecting saved state)
+  renderAutoCoachSettings();
 }
 
 function updateCoachApiKey(val) {
@@ -3604,31 +3638,47 @@ async function runAutoCoachReport(triggerTime) {
   data.tasks_due_by_now = tasksDueByNow;
   data.due_summary      = `${doneCount}/${totalDue} tasks completed by ${triggerTime} | Untracked: ${untrackedNow} | Still pending (window open): ${pendingNow}`;
 
-  // Build auto-coach system prompt
-  const systemPrompt = buildAutoCoachPrompt(doneCount, totalDue, triggerTime);
+  // Use full buildSystemPrompt() — same detailed workflow as manual Tera-Ego
+  const systemPrompt = buildSystemPrompt();
+  const timeContext = `\n\nAUTO CHECK TIME: ${triggerTime}\nTasks due by now (${triggerTime} tak ka data):\n${tasksDueByNow.map(t =>
+    `• [${t.category}] ${t.name} — ${
+      t.completed ? `✅ DONE (effort ${t.effortScore}/10)` :
+      t.isUntracked ? `⚠️ UNTRACKED (window closed — worst case 0 score)` :
+      t.isPending   ? `⏳ PENDING (window abhi open hai — ${t.workingWindowEnd} tak time hai)` :
+                      `❌ NOT DONE`
+    } | Window: ${t.scheduledTime || '?'}→${t.workingWindowEnd || '?'} | Why: ${t.whyMatters}`
+  ).join('\n') || 'Koi task due nahi is time tak'}
 
-  // Call Groq API
-  const fullResponse = await callGroqAPI(systemPrompt, JSON.stringify(data), 400);
+Summary: ${doneCount}/${totalDue} done | Untracked: ${untrackedNow} | Pending (window open): ${pendingNow}
 
-  // Extract first line as notification headline (max 90 chars)
+Format response as:
+Line 1: Ek punchy headline title (notification ke liye — max 90 chars, Hinglish, personal aur direct)
+Blank line
+Full detailed reality check response (task-by-task analysis, working window, efforts, life goals, negative words — sab kuch use kar as per teri personality)`;
+
+  // Call Gemini API with full context
+  const fullResponse = await callGroqAPI(systemPrompt, timeContext + '\n\n' + JSON.stringify(data), 800);
+
+  // Extract first line as notification title, rest as body
   const lines = fullResponse.trim().split('\n').filter(l => l.trim());
-  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Coach ne kuch kaha — dekho!';
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Ego ka check — dekho!';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire browser notification
+  // Fire browser notification — title = headline, body = full response
   if ('Notification' in window && Notification.permission === 'granted') {
     const coachOpts = {
-      body: headline,
+      body: notifBody,
       icon: 'icons/icon-192.png',
       tag: 'auto-coach-' + triggerTime,
       renotify: true
     };
     if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
       navigator.serviceWorker.ready.then(reg => {
-        reg.showNotification('🤖 Aainik Coach', coachOpts);
+        reg.showNotification(headline, coachOpts);
       }).catch(e => console.warn('Notification failed (SW):', e));
     } else {
       try {
-        const n = new Notification('🤖 Aainik Coach', coachOpts);
+        const n = new Notification(headline, coachOpts);
         n.onclick = () => { window.focus(); showScreen('coach'); };
       } catch (e) {
         console.warn('Notification failed:', e);
@@ -3859,9 +3909,9 @@ async function runWeeklyReport() {
   const data  = getCoachData();
   data.report_type = 'weekly_overall';
 
-  // Build 7-day summary
+  // Build 7-day summary — yesterday to 7 days ago (exclude today per spec)
   const last7 = [];
-  for (let i = 6; i >= 0; i--) {
+  for (let i = 7; i >= 1; i--) {
     const d = dateNDaysAgo(i);
     const ds = getDailyScore(d);
     last7.push({ date: d, score: ds.score, done: ds.done, total: ds.total });
@@ -3870,23 +3920,27 @@ async function runWeeklyReport() {
 
   const personality = appData.settings.autoCoachPersonality || 'beast';
   const avgWeekly   = last7.length ? Math.round(last7.reduce((a, b) => a + b.score, 0) / last7.length) : 0;
-  const systemPrompt = buildWeeklyReportPrompt(avgWeekly, personality);
 
-  const fullResponse = await callGeminiAPI(systemPrompt, JSON.stringify(data), 600);
+  // Use full buildSystemPrompt() — same workflow as manual coach
+  const systemPrompt = buildSystemPrompt();
+  const weeklyContext = `\n\nWEEKLY REPORT MODE (last 7 days — aaj se pehle, aaj ka din exclude):\nWeekly Average: ${avgWeekly}%\nDin-by-din breakdown:\n${last7.map(d => `${d.date}: ${d.score}% (${d.done}/${d.total} tasks done)`).join('\n')}\n\nIs 7 din ka full reality check de. Kab strong raha, kab gira — seedha bolta hai. Pattern dekh. Next hafte ke liye 2-3 specific actionable goals bata. Format:\nLine 1: Ek punchy title/headline (notification ke liye — max 90 chars, personal aur direct)\nBlank line\nFull weekly reality check response (as per teri personality aur score-based brutality rules)`;
+
+  const fullResponse = await callGeminiAPI(systemPrompt, weeklyContext + '\n\n' + JSON.stringify(data), 800);
 
   const lines    = fullResponse.trim().split('\n').filter(l => l.trim());
-  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '🗓️ Weekly report ready!';
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📊 Tera-Ego Weekly Report!';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification
+  // Fire notification — title = headline, body = full response
   if ('Notification' in window && Notification.permission === 'granted') {
     const opts = {
-      body: headline, icon: 'icons/icon-192.png',
+      body: notifBody, icon: 'icons/icon-192.png',
       tag: 'weekly-report-' + getISOWeekKey(new Date()), renotify: true
     };
     if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => reg.showNotification('📊 Aainik — Weekly Report', opts));
+      navigator.serviceWorker.ready.then(reg => reg.showNotification(headline, opts));
     } else {
-      try { new Notification('📊 Aainik — Weekly Report', opts); } catch (e) {}
+      try { new Notification(headline, opts); } catch (e) {}
     }
   }
 
@@ -3955,33 +4009,37 @@ async function runDailyProgressReport() {
   const data  = getCoachData();
   data.report_type = 'daily_progress_overall';
 
-  // All-time summary
-  const allDates = [...new Set(appData.history.map(h => h.date))].sort();
+  // All-time summary — exclude today (Day 1 to yesterday per spec)
+  const allDates = [...new Set(appData.history.map(h => h.date))].sort().filter(d => d < today);
   const totalDays = allDates.length;
   const scores    = allDates.map(d => getDailyScore(d).score);
   const allTimeAvg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
   const bestScore  = scores.length ? Math.max(...scores) : 0;
   const worstScore = scores.length ? Math.min(...scores) : 0;
+  const bestDay    = allDates[scores.indexOf(Math.max(...scores, 0))] || 'N/A';
+  const worstDay   = allDates[scores.indexOf(Math.min(...scores, 100))] || 'N/A';
 
-  data.all_time_summary = { totalDays, allTimeAvg, bestScore, worstScore, firstDay: allDates[0] || today };
+  data.all_time_summary = { totalDays, allTimeAvg, bestScore, worstScore, firstDay: allDates[0] || today, bestDay, worstDay };
 
-  const personality  = appData.settings.autoCoachPersonality || 'beast';
-  const systemPrompt = buildDailyProgressPrompt(allTimeAvg, totalDays, personality);
+  // Use full buildSystemPrompt() — same workflow as manual coach
+  const systemPrompt = buildSystemPrompt();
+  const overallContext = `\n\nOVERALL PROGRESS REPORT MODE (Day 1 se kal tak — aaj ka din exclude):\nTotal days tracked: ${totalDays} | All-time average: ${allTimeAvg}% | Best: ${bestScore}% (${bestDay}) | Worst: ${worstScore}% (${worstDay}) | Journey started: ${allDates[0] || 'N/A'}\n\nPoori journey ka seedha honest assessment de — kab shuru hua, kaise chala, kahan gira, kahan utha. Specific numbers use kar. Aaj ke liye ek strong direction de. Format:\nLine 1: Ek punchy headline title (notification ke liye — max 90 chars)\nBlank line\nFull overall progress reality check (as per teri personality aur score-based brutality rules)`;
 
-  const fullResponse = await callGeminiAPI(systemPrompt, JSON.stringify(data), 500);
+  const fullResponse = await callGeminiAPI(systemPrompt, overallContext + '\n\n' + JSON.stringify(data), 800);
 
   const lines    = fullResponse.trim().split('\n').filter(l => l.trim());
-  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Progress report ready!';
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Tera-Ego Progress Report!';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
   if ('Notification' in window && Notification.permission === 'granted') {
     const opts = {
-      body: headline, icon: 'icons/icon-192.png',
+      body: notifBody, icon: 'icons/icon-192.png',
       tag: 'daily-progress-' + today, renotify: true
     };
     if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => reg.showNotification('📈 Aainik — Daily Progress', opts));
+      navigator.serviceWorker.ready.then(reg => reg.showNotification(headline, opts));
     } else {
-      try { new Notification('📈 Aainik — Daily Progress', opts); } catch (e) {}
+      try { new Notification(headline, opts); } catch (e) {}
     }
   }
 
@@ -3990,7 +4048,7 @@ async function runDailyProgressReport() {
     id: 'conv_daily_prog_' + Date.now(), type: 'daily_progress',
     timestamp: Date.now(), date: today,
     scoreLabel: `📈 Daily Progress — ${totalDays} days | Avg: ${allTimeAvg}%`,
-    response: fullResponse, headline, personality
+    response: fullResponse, headline
   });
   if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
   saveData();
@@ -5780,7 +5838,7 @@ async function initCapacitorNotifications() {
       {
         id: 'aainik-ego',
         name: 'Ego AI Reports',
-        description: 'My-Ego AI reality check notifications',
+        description: 'Tera-Ego AI reality check notifications',
         importance: 3,
         visibility: 1,
         vibration: true
@@ -5788,7 +5846,7 @@ async function initCapacitorNotifications() {
       {
         id: 'aainik-josh',
         name: 'Josh Reminders',
-        description: 'My-Josh motivational reminders',
+        description: 'Tera-Josh motivational reminders',
         importance: 4,
         visibility: 1,
         vibration: true,
