@@ -5730,22 +5730,34 @@ async function initCapacitorNotifications() {
     const { LocalNotifications } = (window.Capacitor && window.Capacitor.Plugins) || {};
     if (!LocalNotifications) return;
 
-    // Request permission
     const perm = await LocalNotifications.requestPermissions();
-    if (perm.display !== 'granted') {
-      console.warn('Aainik: Notification permission denied');
-      return;
-    }
-    console.log('Aainik: Notification permission granted');
+    if (perm.display !== 'granted') return;
 
-    // Create Android notification channels (required for Android 8+)
+    // ── Patch Web Notification API for Capacitor WebView ──
+    // Android WebView me window.Notification nahi hoti
+    // Isliye hum ise manually set karte hain taaki baaki app code kaam kare
+    try {
+      if (!('Notification' in window)) {
+        window.Notification = {
+          permission: 'granted',
+          requestPermission: async () => 'granted'
+        };
+      } else {
+        Object.defineProperty(Notification, 'permission', {
+          get: () => 'granted',
+          configurable: true
+        });
+      }
+    } catch(e) {}
+
+    // Create Android notification channels
     const channels = [
       {
         id: 'aainik-tasks',
         name: 'Task Reminders',
         description: 'Daily task reminder notifications',
-        importance: 4,   // IMPORTANCE_HIGH
-        visibility: 1,   // PUBLIC
+        importance: 4,
+        visibility: 1,
         vibration: true,
         lights: true,
         lightColor: '#A29BFE'
@@ -5754,7 +5766,7 @@ async function initCapacitorNotifications() {
         id: 'aainik-ego',
         name: 'Ego AI Reports',
         description: 'My-Ego AI reality check notifications',
-        importance: 3,   // IMPORTANCE_DEFAULT
+        importance: 3,
         visibility: 1,
         vibration: true
       },
@@ -5771,16 +5783,13 @@ async function initCapacitorNotifications() {
     ];
 
     for (const ch of channels) {
-      try { await LocalNotifications.createChannel(ch); } catch (e) {
-        console.warn('Channel create warn:', ch.id, e.message);
-      }
+      try { await LocalNotifications.createChannel(ch); } catch(e) {}
     }
 
-    // Schedule all notifications for next 7 days
     await scheduleAllCapacitorNotifications();
 
-  } catch (e) {
-    console.warn('Aainik: Capacitor notifications init error:', e);
+  } catch(e) {
+    console.warn('Capacitor notifications init error:', e);
   }
 }
 
