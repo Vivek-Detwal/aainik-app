@@ -212,12 +212,12 @@
 
     <!-- ── TAB SELECTOR ── -->
     <div class="coach-tabs">
-      <button class="coach-tab active" id="tab-ego-btn" onclick="switchCoachTab('ego')">🧠 My-Ego</button>
-      <button class="coach-tab" id="tab-josh-btn" onclick="switchCoachTab('josh')">💪 My-Josh</button>
+      <button class="coach-tab active" id="tab-ego-btn" onclick="switchCoachTab('ego')">🧠 Tera-Ego</button>
+      <button class="coach-tab" id="tab-josh-btn" onclick="switchCoachTab('josh')">💪 Tera-Josh</button>
     </div>
 
     <!-- ══════════════════════════════════════
-         MY-EGO PANEL
+         TERA-EGO PANEL
     ═══════════════════════════════════════ -->
     <div id="coach-panel-ego" class="coach-panel">
 
@@ -294,7 +294,7 @@
     </div><!-- /coach-panel-ego -->
 
     <!-- ══════════════════════════════════════
-         MY-JOSH PANEL
+         TERA-JOSH PANEL
     ═══════════════════════════════════════ -->
     <div id="coach-panel-josh" class="coach-panel hidden">
 
@@ -427,7 +427,7 @@
 
       <!-- ── ACCOUNT 4 + 5: Coach Configuration ── -->
       <div class="settings-section" id="coach-config-section">
-        <div class="settings-section-title">🧠 My-Ego Settings</div>
+        <div class="settings-section-title">🧠 Tera-Ego Settings</div>
 
         <div class="setting-row">
           <div class="setting-info">
@@ -529,7 +529,7 @@
 
       <!-- ── EGO AI MODE: Auto Reports Settings ── -->
       <div class="settings-section" id="auto-coach-section">
-        <div class="settings-section-title">🧠 My-Ego — Auto Checks</div>
+        <div class="settings-section-title">🧠 Tera-Ego — Auto Checks</div>
         <div class="settings-sub-title">Auto Ego Checks (Max 10)</div>
         <div class="setting-desc" style="padding:0 0 12px 0;color:var(--text-secondary)">
           Scheduled times pe automatic Ego AI report + background notification milega
@@ -637,7 +637,7 @@
 
       <!-- ── ACCOUNT 4 (JOSH): My-Josh Settings ── -->
       <div class="settings-section" id="josh-config-section">
-        <div class="settings-section-title">💪 My-Josh Settings</div>
+        <div class="settings-section-title">💪 Tera-Josh Settings</div>
         <div class="setting-desc" style="padding:0 0 12px;color:var(--text-secondary)">
           Josh tera hype man aur reminder hai — upcoming tasks yaad dilata hai aur motivate karta hai
         </div>
@@ -686,11 +686,15 @@
         <!-- Josh Prompt (editable) -->
         <div class="settings-sub-title" style="margin-top:16px">Josh Auto Prompt (Editable)</div>
         <div class="setting-desc" style="margin-bottom:8px;color:var(--text-secondary)">
-          Josh ki auto reminder ke liye custom prompt. Empty chhod do = default use hoga.
+          Tera-Josh ki auto reminder ke liye custom prompt. Empty chhod do = default use hoga.
         </div>
         <textarea class="form-textarea coach-prompt-area" id="josh-prompt-textarea" rows="6"
-          placeholder="Empty chhod do default Josh prompt use karne ke liye..."
+          placeholder="Empty chhod do default Tera-Josh prompt use karne ke liye..."
           oninput="updateJoshPrompt(this.value)"></textarea>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn-secondary" onclick="resetJoshPrompt()" style="flex:1">↺ Default Restore</button>
+          <button class="btn-primary" onclick="saveJoshPrompt()" style="flex:1">💾 Save Prompt</button>
+        </div>
       </div>
 
       <!-- ── ACCOUNT 4: Profile & Badges ── -->
