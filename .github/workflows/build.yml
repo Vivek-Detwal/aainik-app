@@ -1,0 +1,127 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      - name: Set up Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Prepare www directory
+        run: |
+          mkdir -p www/icons
+          cp aainik_account4/index.html www/
+          cp aainik_account4/app.js www/
+          cp aainik_account4/styles.css www/
+          cp aainik_account4/sw.js www/
+          cp aainik_account4/manifest.json www/
+          # Copy icons if present, else generate placeholders
+          if [ -d "aainik_account4/icons" ] && [ "$(ls -A aainik_account4/icons 2>/dev/null)" ]; then
+            cp -r aainik_account4/icons/* www/icons/
+          else
+            node -e "
+              const fs = require('fs');
+              const zlib = require('zlib');
+              function makePNG(size) {
+                const rows = [];
+                for (let y = 0; y < size; y++) {
+                  const row = [0];
+                  for (let x = 0; x < size; x++) {
+                    const cx = size/2, cy = size/2;
+                    const r = Math.sqrt((x-cx)**2+(y-cy)**2);
+                    if (r <= size*0.45) { row.push(162,155,254); }
+                    else { row.push(26,26,46); }
+                  }
+                  rows.push(Buffer.from(row));
+                }
+                const raw = Buffer.concat(rows);
+                const compressed = zlib.deflateSync(raw);
+                function u32(n){const b=Buffer.alloc(4);b.writeUInt32BE(n);return b;}
+                function crc32(buf){let c=0xffffffff;for(const b of buf){c^=b;for(let i=0;i<8;i++)c=c&1?(c>>>1)^0xedb88320:(c>>>1);}return(c^0xffffffff)>>>0;}
+                function chunk(name,data){const n=Buffer.from(name);const d=Buffer.from(data);const crc=u32(crc32(Buffer.concat([n,d])));return Buffer.concat([u32(d.length),n,d,crc]);}
+                const sig=Buffer.from([137,80,78,71,13,10,26,10]);
+                const W=Buffer.alloc(13);W.writeUInt32BE(size,0);W.writeUInt32BE(size,4);W[8]=8;W[9]=2;
+                return Buffer.concat([sig,chunk('IHDR',W),chunk('IDAT',compressed),chunk('IEND',Buffer.alloc(0))]);
+              }
+              fs.writeFileSync('www/icons/icon-192.png', makePNG(192));
+              fs.writeFileSync('www/icons/icon-512.png', makePNG(512));
+              console.log('Icons generated');
+            "
+          fi
+          echo "www/ contents:"
+          ls -la www/
+          ls -la www/icons/
+
+      - name: Add Capacitor Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Grant execute permission to gradlew
+        run: chmod +x android/gradlew
+
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Build Debug APK
+        run: |
+          cd android
+          ./gradlew assembleDebug --no-daemon --stacktrace
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx4g"
+
+      - name: Upload Debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: aainik-debug-apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 30
+
+      - name: Build Release APK (unsigned)
+        run: |
+          cd android
+          ./gradlew assembleRelease --no-daemon
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.daemon=false -Xmx4g"
+        continue-on-error: true
+
+      - name: Upload Release APK (unsigned)
+        uses: actions/upload-artifact@v4
+        with:
+          name: aainik-release-apk-unsigned
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          retention-days: 30
+        continue-on-error: true

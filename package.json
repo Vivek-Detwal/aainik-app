@@ -1,0 +1,26 @@
+{
+  "name": "aainik-task-mastery",
+  "version": "2.0.0",
+  "description": "Aainik Task Mastery — Personal Productivity Android App",
+  "private": true,
+  "scripts": {
+    "sync": "npx cap sync android",
+    "build:android": "npx cap build android",
+    "open:android": "npx cap open android",
+    "copy:www": "cp aainik_account4/index.html aainik_account4/app.js aainik_account4/styles.css aainik_account4/sw.js aainik_account4/manifest.json www/ && cp -r aainik_account4/icons/* www/icons/ 2>/dev/null || true",
+    "add:android": "npx cap add android",
+    "cap:init": "npx cap add android && npx cap sync android"
+  },
+  "dependencies": {
+    "@capacitor/android": "6.1.2",
+    "@capacitor/core": "6.1.2",
+    "@capacitor/local-notifications": "6.1.0",
+    "@capacitor/splash-screen": "6.0.2",
+    "@capacitor/status-bar": "6.0.2",
+    "@capacitor/app": "6.0.2",
+    "@capacitor/haptics": "6.0.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "6.1.2"
+  }
+}
