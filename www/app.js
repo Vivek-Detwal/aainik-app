@@ -5736,19 +5736,34 @@ async function initCapacitorNotifications() {
     // ── Patch Web Notification API for Capacitor WebView ──
     // Android WebView me window.Notification nahi hoti
     // Isliye hum ise manually set karte hain taaki baaki app code kaam kare
-    try {
-      if (!('Notification' in window)) {
-        window.Notification = {
-          permission: 'granted',
-          requestPermission: async () => 'granted'
-        };
-      } else {
-        Object.defineProperty(Notification, 'permission', {
-          get: () => 'granted',
-          configurable: true
-        });
-      }
-    } catch(e) {}
+  try {
+  if (!('Notification' in window)) {
+    function Notification(title, opts) {
+      try {
+        const { LocalNotifications } = (window.Capacitor && window.Capacitor.Plugins) || {};
+        if (LocalNotifications) {
+          const fireAt = new Date(Date.now() + 500);
+          LocalNotifications.schedule({ notifications: [{
+            id: Math.floor(Math.random() * 99999) + 1,
+            title: title,
+            body: (opts && opts.body) || '',
+            channelId: 'aainik-tasks',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground'
+          }]});
+        }
+      } catch(e) { console.warn('Notif shim error:', e); }
+    }
+    Notification.permission = 'granted';
+    Notification.requestPermission = async () => 'granted';
+    window.Notification = Notification;
+  } else {
+    Object.defineProperty(Notification, 'permission', {
+      get: () => 'granted',
+      configurable: true
+    });
+  }
+} catch(e) {}
 
     // Create Android notification channels
     const channels = [
