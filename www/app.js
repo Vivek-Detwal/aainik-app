@@ -6235,66 +6235,13 @@ async function scheduleAllCapacitorNotifications() {
         }
       });
 
-      // ── Ego AI auto-check notifications ──
-      if (appData.settings.autoCoachEnabled) {
-        // Build a quick pending task count for this slot (used as fallback text when AI hasn't run yet)
-        const totalActiveTasks = (appData.tasks || []).filter(t => t.active !== false).length;
-        const todayStr = targetDate.getFullYear() + '-' + String(targetDate.getMonth()+1).padStart(2,'0') + '-' + String(targetDate.getDate()).padStart(2,'0');
-        const doneTodaySoFar = (appData.history || []).filter(h => h.date === todayStr && h.completed).length;
-        const pendingCount = Math.max(0, totalActiveTasks - doneTodaySoFar);
+      // ── Ego AI auto-check: NO pre-scheduled notification ──
+      // Ego uses Gemini API to generate a real response — fireCapacitorNativeNotif()
+      // fires 1-2 min after trigger time once AI responds. Pre-scheduled static
+      // placeholders are intentionally removed so only the real AI notification appears.
 
-        (appData.settings.autoCoachTimes || []).forEach((entry, idx) => {
-          if (!entry.enabled || !entry.time) return;
-          const [h, m] = entry.time.split(':').map(Number);
-          const fireAt = new Date(targetDate);
-          fireAt.setHours(h, m, 0, 0);
-          if (fireAt <= now) return;
-          const id = Math.abs((1000000 + dayOffset * 100 + idx) % 2100000000);
-          const fallbackBody = pendingCount > 0
-            ? `${pendingCount} task${pendingCount > 1 ? 's' : ''} abhi bhi pending ${pendingCount > 1 ? 'hain' : 'hai'}. App kholo — Ego tera full reality check dega!`
-            : `${doneTodaySoFar}/${totalActiveTasks} tasks done. App kholo — Ego tera progress report dega!`;
-          notifications.push({
-            id: id || (1000000 + dayOffset * 100 + idx + 1),
-            title: '🧠 Ego Check — Aainik',
-            body: fallbackBody,
-            channelId: 'aainik-ego',
-            schedule: { at: fireAt, allowWhileIdle: true },
-            smallIcon: 'ic_launcher_foreground',
-            extra: { type: 'ego_check', time: entry.time, screen: 'coach' }
-          });
-        });
-      }
-
-      // ── Josh auto-reminder notifications ──
-      if (appData.settings.joshAutoEnabled) {
-        (appData.settings.joshAutoTimes || []).forEach((entry, idx) => {
-          if (!entry.enabled || !entry.time) return;
-          const [h, m] = entry.time.split(':').map(Number);
-          const fireAt = new Date(targetDate);
-          fireAt.setHours(h, m, 0, 0);
-          if (fireAt <= now) return;
-          const id = Math.abs((2000000 + dayOffset * 100 + idx) % 2100000000);
-          // Build a data-driven fallback text — upcoming tasks after this time slot
-          const upcomingTasks = (appData.tasks || []).filter(t => {
-            if (!t.active) return false;
-            const wStart = t.workingWindowStart || t.scheduledTime || '00:00';
-            return wStart >= entry.time;
-          }).slice(0, 3);
-          const taskNames = upcomingTasks.map(t => t.name).join(', ');
-          const joshFallback = upcomingTasks.length > 0
-            ? `${upcomingTasks.length} task${upcomingTasks.length > 1 ? 's' : ''} aage hain: ${taskNames}. Josh motivational reminder ke saath aa raha hai!`
-            : `App kholo — Josh tera aaj ka ek personalized motivation dega!`;
-          notifications.push({
-            id: id || (2000000 + dayOffset * 100 + idx + 1),
-            title: '💪 Josh — Task Reminder',
-            body: joshFallback,
-            channelId: 'aainik-josh',
-            schedule: { at: fireAt, allowWhileIdle: true },
-            smallIcon: 'ic_launcher_foreground',
-            extra: { type: 'josh_reminder', time: entry.time, screen: 'coach' }
-          });
-        });
-      }
+      // ── Josh auto-reminder: NO pre-scheduled notification ──
+      // Josh uses Gemini API too — same reason as Ego above.
     }
 
     if (notifications.length > 0) {
