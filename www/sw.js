@@ -291,7 +291,34 @@ async function swShowAiNotification(title, fullBody, tag, convType) {
   });
 }
 
-/* ─── SW helper: call Gemini API ─── */
+/* ─── SW helper: get available API key using RPD/RPM tracking ─── */
+function swGetAvailableKey(appData) {
+  const s = appData.settings || {};
+  const candidates = [
+    { key: s.coachApiKey,  id: 'key_0' },
+    { key: s.coachApiKey2, id: 'key_1' },
+    { key: s.coachApiKey3, id: 'key_2' }
+  ].filter(k => k.key && k.key.trim());
+
+  if (!candidates.length) return null;
+
+  const stats    = s.apiKeyStats || {};
+  const now      = new Date();
+  const today    = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-' + String(now.getDate()).padStart(2,'0');
+  const minuteStr = today + 'T' + String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+
+  for (const k of candidates) {
+    const ks      = stats[k.id] || {};
+    const rpdUsed = (ks.rpd && ks.rpd.date   === today)     ? ks.rpd.count  : 0;
+    const rpmUsed = (ks.rpm && ks.rpm.minute === minuteStr) ? ks.rpm.count  : 0;
+    if (rpdUsed >= 18) continue;
+    if (rpmUsed >= 4)  continue;
+    return { key: k.key, keyId: k.id };
+  }
+  return null;
+}
+
+/* ─── SW helper: call Gemini API with smart key rotation ─── */
 async function swCallGemini(apiKey, model, systemText, userText, maxTokens) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const resp = await fetch(url, {
@@ -336,6 +363,8 @@ function swDateNDaysAgo(n) {
 }
 
 async function swCallGeminiForWeekly(appData, apiKey, now, today) {
+  const keyInfo = swGetAvailableKey(appData);
+  const activeKey = keyInfo ? keyInfo.key : apiKey; // fallback to passed key
   const model = appData.settings.geminiModel || 'gemini-2.5-flash';
   const personality = appData.settings.autoCoachPersonality || 'beast';
   const last7 = [];
@@ -345,12 +374,14 @@ async function swCallGeminiForWeekly(appData, apiKey, now, today) {
   const negWords  = (appData.settings.egoNegativeWords || '').trim();
   const sysText   = swBuildTone(personality, 'weekly') + (lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '') + (negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '');
   const userText  = `WEEKLY REPORT MODE:\nWeekly Average: ${avgWeekly}%\nLast 7 days:\n${last7.map(d => `${d.date}: ${d.score}% (${d.done}/${d.total})`).join('\n')}\n\nIs 7 din ka full reality check de. Pattern dekh. Next hafte ke liye 2-3 actionable goals bata.\nFormat:\nLine 1: Ek punchy headline (max 90 chars, Hinglish, personal)\nBlank line\nFull weekly reality check response`;
-  const raw = await swCallGemini(apiKey, model, sysText, userText, 800);
+  const raw = await swCallGemini(activeKey, model, sysText, userText, 800);
   const lines = raw.trim().split('\n').filter(l => l.trim());
   return { headline: lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📊 Weekly Report', notifBody: lines.slice(1).join('\n').trim() || raw.trim(), fullResponse: raw };
 }
 
 async function swCallGeminiForDaily(appData, apiKey, today) {
+  const _ki = swGetAvailableKey(appData);
+  const activeKey = _ki ? _ki.key : apiKey;
   const model = appData.settings.geminiModel || 'gemini-2.5-flash';
   const personality = appData.settings.autoCoachPersonality || 'beast';
   const allDates = [...new Set((appData.history || []).map(h => h.date))].sort().filter(d => d < today);
@@ -362,12 +393,14 @@ async function swCallGeminiForDaily(appData, apiKey, today) {
   const negWords  = (appData.settings.egoNegativeWords || '').trim();
   const sysText   = swBuildTone(personality, 'daily_progress') + (lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '') + (negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '');
   const userText  = `OVERALL PROGRESS REPORT:\nTotal days: ${allDates.length} | Avg: ${avg}% | Best: ${best}% | Worst: ${worst}% | Started: ${allDates[0] || 'N/A'}\n\nPoori journey ka honest assessment de. Specific numbers use kar.\nFormat:\nLine 1: Ek punchy headline (max 90 chars)\nBlank line\nFull overall progress reality check`;
-  const raw = await swCallGemini(apiKey, model, sysText, userText, 800);
+  const raw = await swCallGemini(activeKey, model, sysText, userText, 800);
   const lines = raw.trim().split('\n').filter(l => l.trim());
   return { headline: lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Progress Report', notifBody: lines.slice(1).join('\n').trim() || raw.trim(), fullResponse: raw };
 }
 
 async function swCallGeminiForAutoCoach(appData, apiKey, today, triggerTime) {
+  const _ki2 = swGetAvailableKey(appData);
+  const activeKey = _ki2 ? _ki2.key : apiKey;
   const model = appData.settings.geminiModel || 'gemini-2.5-flash';
   const personality = appData.settings.autoCoachPersonality || 'beast';
   const tasks = (appData.tasks || []).filter(t => t.active !== false);
@@ -384,7 +417,7 @@ async function swCallGeminiForAutoCoach(appData, apiKey, today, triggerTime) {
   const sysText   = swBuildTone(personality, 'auto') + (lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '') + (negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '');
   const taskLines = tasksDue.map(t => `• [${t.category}] ${t.name} — ${t.completed ? `✅ DONE (effort ${t.effortScore}/10)` : t.isUntracked ? `⚠️ UNTRACKED` : t.isPending ? `⏳ PENDING` : `❌ NOT DONE`} | Window: ${t.window} | Why: ${t.whyMatters}`).join('\n') || 'Koi task due nahi';
   const userText  = `AUTO CHECK TIME: ${triggerTime}\nTasks due by now:\n${taskLines}\nSummary: ${doneCount}/${tasksDue.length} done\n\nFormat:\nLine 1: Ek punchy headline (max 90 chars, Hinglish, personal)\nBlank line\nFull detailed reality check (task-by-task, efforts, goals connect)`;
-  const raw = await swCallGemini(apiKey, model, sysText, userText, 800);
+  const raw = await swCallGemini(activeKey, model, sysText, userText, 800);
   const lines = raw.trim().split('\n').filter(l => l.trim());
   return { headline: lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Ego ka check!', notifBody: lines.slice(1).join('\n').trim() || raw.trim(), fullResponse: raw };
 }
