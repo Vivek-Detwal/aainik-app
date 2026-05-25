@@ -263,6 +263,25 @@ function getDefaultData() {
 ───────────────────────────────────────────── */
 let appData = null;
 
+/* ─────────────────────────────────────────────
+   APP STATE TRACKING
+   Used to decide: foreground / background / killed
+   _appInForeground = true  → app is open & visible
+   _appInForeground = false → app is in background (screen off / switched)
+   _appWasKilled    = true  → app was force-killed or not running (set on init)
+───────────────────────────────────────────── */
+let _appInForeground = true;
+let _appWasKilled    = false;
+
+/* ─────────────────────────────────────────────
+   PENDING AUTO-RESPONSE QUEUE
+   When app was killed and pre-scheduled notifications fired,
+   on return to app we queue the missed Ego/Josh Gemini responses
+   and fire them one-by-one with 1-minute gaps.
+───────────────────────────────────────────── */
+let _pendingAutoQueue = [];   // [{ type: 'ego'|'josh', time: 'HH:MM' }, ...]
+let _queueProcessing  = false;
+
 function saveData() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
@@ -2508,18 +2527,7 @@ INSTRUCTIONS:
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Josh: Aaj ke tasks yaad hain? 💪';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 4-5 line AI summary in notification body
-  // On Android Capacitor: use LocalNotifications so actual AI content is visible
-  // On web: fall back to standard Web Notification API
-  const capFiredJosh = await fireCapacitorNativeNotif(
-    '💪 ' + headline,
-    notifBody,
-    'aainik-josh',
-    'josh_auto'
-  );
-  if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
-
-  // Save to joshConversations
+  // Save to joshConversations FIRST (always, regardless of app state)
   if (!appData.joshConversations) appData.joshConversations = [];
   appData.joshConversations.unshift({
     id: 'jc_auto_' + Date.now(),
@@ -2534,8 +2542,24 @@ INSTRUCTIONS:
   if (appData.joshConversations.length > 30) appData.joshConversations = appData.joshConversations.slice(0, 30);
   saveData();
 
-  if (currentScreen === 'coach') renderJoshMessages();
-  showToast(`💪 Josh: ${headline.substring(0, 50)}...`);
+  // ── Decide how to deliver the response based on app state ──
+  if (_appInForeground) {
+    // App is OPEN → show directly in UI, no notification
+    if (currentScreen === 'coach') {
+      switchCoachTab('josh');
+      renderJoshMessages();
+    }
+    showToast(`💪 Josh: ${headline.substring(0, 60)}`);
+  } else {
+    // App is in BACKGROUND → fire native notification with real Gemini response
+    const capFiredJosh = await fireCapacitorNativeNotif(
+      '💪 ' + headline,
+      notifBody,
+      'aainik-josh',
+      'josh_auto'
+    );
+    if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
+  }
 }
 
 function checkJoshAutoTriggers(hhmm) {
@@ -3808,18 +3832,7 @@ Full detailed reality check response (task-by-task analysis, working window, eff
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Ego ka check — dekho!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 4-5 line AI summary in notification body
-  // On Android Capacitor: use LocalNotifications so actual AI content is visible
-  // On web: fall back to standard Web Notification API
-  const capFiredEgo = await fireCapacitorNativeNotif(
-    '🧠 ' + headline,
-    notifBody,
-    'aainik-ego',
-    'auto'
-  );
-  if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
-
-  // Save to conversation history
+  // Save to conversation history FIRST (always, regardless of app state)
   if (!appData.conversations) appData.conversations = [];
   appData.conversations.unshift({
     id:           'conv_auto_' + Date.now(),
@@ -3833,16 +3846,27 @@ Full detailed reality check response (task-by-task analysis, working window, eff
     headline,
     personality:  appData.settings.autoCoachPersonality || 'beast'
   });
-
-  // Keep last 30
   if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
   saveData();
 
-  // If user is on coach screen, refresh it
-  if (currentScreen === 'coach') renderCoachScreen();
-
-  // Show a subtle toast if app is open
-  showToast(`🤖 Auto-coach check: ${headline.substring(0, 50)}...`);
+  // ── Decide how to deliver the response based on app state ──
+  if (_appInForeground) {
+    // App is OPEN → show directly in UI, no notification
+    if (currentScreen === 'coach') {
+      switchCoachTab('ego');
+      renderCoachScreen();
+    }
+    showToast(`🧠 Ego: ${headline.substring(0, 60)}`);
+  } else {
+    // App is in BACKGROUND → fire native notification with real Gemini response
+    const capFiredEgo = await fireCapacitorNativeNotif(
+      '🧠 ' + headline,
+      notifBody,
+      'aainik-ego',
+      'auto'
+    );
+    if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
+  }
 }
 
 /* ─────────────────────────────────────────────
@@ -4143,6 +4167,149 @@ function checkMissedReports() {
       }, 7000);
     }
   }
+}
+
+/* ─────────────────────────────────────────────
+   MISSED RESPONSE QUEUE SYSTEM
+   When app was killed and pre-scheduled notifications (Ego/Josh)
+   fired, user gets static placeholder text. On return to app,
+   we build a queue of the missed Gemini responses and fire them
+   one-by-one with 1-minute gaps so user gets real AI content.
+───────────────────────────────────────────── */
+
+/**
+ * Check if a HH:MM time string fell inside [fromMs, toMs] window today.
+ */
+function _wasTimeDueInWindow(timeStr, fromMs, toMs) {
+  const [h, m] = (timeStr || '00:00').split(':').map(Number);
+  const now = new Date();
+  const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0).getTime();
+  return candidate > fromMs && candidate <= toMs;
+}
+
+/**
+ * Build queue of Ego/Josh responses missed while app was killed.
+ * Called once on app start if _appWasKilled is true.
+ */
+function buildMissedResponseQueue() {
+  if (!_appWasKilled) return;
+  if (!hasAnyApiKey()) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+  const now   = Date.now();
+  const today = getTodayStr();
+  const s     = appData.settings;
+
+  // ── Smart day-bound queue ──
+  // Queue only contains responses for TODAY.
+  // If app was killed yesterday (or earlier), those slots are a different
+  // day — purge them from pending and mark as skipped so they never fire.
+  // Rule: if the scheduled HH:MM belongs to today's date → queue it.
+  //       if it belongs to a past date → mark fired, discard silently.
+
+  // "Today midnight" in ms — anything before this = yesterday or older
+  const todayMidnight = (() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d.getTime();
+  })();
+
+  // Current time as "HH:MM" — only queue times that have already passed today
+  const nowHHMM = String(new Date().getHours()).padStart(2,'0') + ':' +
+                  String(new Date().getMinutes()).padStart(2,'0');
+
+  let lastBeat;
+  try {
+    lastBeat = parseInt(localStorage.getItem('_aainik_heartbeat') || '0');
+  } catch(e) { lastBeat = 0; }
+
+  // Was the last heartbeat from a previous day?
+  const lastBeatWasYesterday = lastBeat > 0 && lastBeat < todayMidnight;
+
+  let skippedOldDay = 0;
+
+  // ── Ego missed responses ──
+  if (s.autoCoachEnabled) {
+    (s.autoCoachTimes || []).forEach(entry => {
+      if (!entry.enabled || !entry.time) return;
+      const todayFireKey = today + '_' + entry.time;
+
+      // Already ran today? skip
+      if (s.lastAutoCoachFired && s.lastAutoCoachFired[todayFireKey]) return;
+
+      if (lastBeatWasYesterday) {
+        // App was killed before midnight — yesterday's pending slots are stale.
+        // Mark them as done so they never queue again, then skip.
+        if (!s.lastAutoCoachFired) s.lastAutoCoachFired = {};
+        s.lastAutoCoachFired[todayFireKey] = true;
+        skippedOldDay++;
+        return;
+      }
+
+      // App was killed today — only queue times that have passed since last heartbeat
+      if (entry.time > nowHHMM) return;           // hasn't fired yet today, skip
+      if (!_wasTimeDueInWindow(entry.time, lastBeat, now)) return; // outside missed window
+
+      _pendingAutoQueue.push({ type: 'ego', time: entry.time });
+    });
+  }
+
+  // ── Josh missed responses ──
+  if (s.joshAutoEnabled) {
+    (s.joshAutoTimes || []).forEach(entry => {
+      if (!entry.enabled || !entry.time) return;
+      const todayFireKey = today + '_' + entry.time;
+
+      if (s.lastJoshAutoFired && s.lastJoshAutoFired[todayFireKey]) return;
+
+      if (lastBeatWasYesterday) {
+        if (!s.lastJoshAutoFired) s.lastJoshAutoFired = {};
+        s.lastJoshAutoFired[todayFireKey] = true;
+        skippedOldDay++;
+        return;
+      }
+
+      if (entry.time > nowHHMM) return;
+      if (!_wasTimeDueInWindow(entry.time, lastBeat, now)) return;
+
+      _pendingAutoQueue.push({ type: 'josh', time: entry.time });
+    });
+  }
+
+  if (skippedOldDay > 0) saveData(); // persist the "already fired" marks
+
+  if (_pendingAutoQueue.length > 0) {
+    console.log('Aainik: ' + _pendingAutoQueue.length + ' missed response(s) queued for today' +
+      (skippedOldDay > 0 ? ' | ' + skippedOldDay + ' from previous day(s) discarded' : ''));
+    showToast('🔄 ' + _pendingAutoQueue.length + ' missed response' +
+      (_pendingAutoQueue.length > 1 ? 's' : '') + ' process ho rahi hain...');
+    processAutoResponseQueue();
+  } else {
+    console.log('Aainik: No missed responses for today' +
+      (skippedOldDay > 0 ? ' (' + skippedOldDay + ' from previous day(s) discarded)' : ''));
+  }
+}
+
+/**
+ * Process one item from the pending queue, then schedule next after 1 minute.
+ */
+function processAutoResponseQueue() {
+  if (_queueProcessing || _pendingAutoQueue.length === 0) return;
+  _queueProcessing = true;
+
+  const item = _pendingAutoQueue.shift();
+
+  const runFn = item.type === 'ego' ? runAutoCoachReport : runJoshAutoReminder;
+
+  runFn(item.time)
+    .catch(err => console.warn('Aainik: Queue item failed:', err.message))
+    .finally(() => {
+      _queueProcessing = false;
+      if (_pendingAutoQueue.length > 0) {
+        // 1 minute gap between each queued response
+        setTimeout(processAutoResponseQueue, 60000);
+      }
+    });
 }
 
 function checkWeeklyReportTrigger(hhmm) {
@@ -5716,6 +5883,23 @@ function scheduleMidnightReset() {
    APP INIT
 ───────────────────────────────────────────── */
 function initApp() {
+  // ── Detect if app was killed (not just backgrounded) ──
+  // We save a heartbeat every 30s while foreground. If the gap since
+  // the last heartbeat is > 2 minutes, app was killed/force-stopped.
+  try {
+    const lastBeat = parseInt(localStorage.getItem('_aainik_heartbeat') || '0');
+    _appWasKilled = lastBeat > 0 && (Date.now() - lastBeat) > 120000; // >2 min
+    // Save fresh heartbeat immediately
+    localStorage.setItem('_aainik_heartbeat', String(Date.now()));
+  } catch(e) {}
+
+  // ── Start heartbeat ticker (every 30s while foreground) ──
+  setInterval(() => {
+    if (_appInForeground) {
+      try { localStorage.setItem('_aainik_heartbeat', String(Date.now())); } catch(e) {}
+    }
+  }, 30000);
+
   loadData();
   applyTheme(appData.settings.theme || 'dark');
 
@@ -5744,6 +5928,13 @@ function initApp() {
 
   // Catch-up: fire weekly/daily reports if they were scheduled while app was closed
   setTimeout(checkMissedReports, 5000);
+
+  // ── Missed auto-response queue (if app was killed) ──
+  // If app was killed and pre-scheduled notifications fired in the background,
+  // now that user is back — queue the real Gemini responses (1 min gap each)
+  if (_appWasKilled) {
+    setTimeout(buildMissedResponseQueue, 8000); // wait 8s for data + Capacitor to init
+  }
 }
 
 // Start the app
@@ -6022,11 +6213,32 @@ function initCapacitorAndroid() {
 
   console.log('Aainik: Capacitor native mode detected');
 
-  // Hardware back button
+  // Hardware back button + App state change tracking
   const { App } = window.Capacitor.Plugins || {};
   if (App) {
     App.addListener('backButton', handleAndroidBack);
+
+    // Track foreground / background transitions
+    App.addListener('appStateChange', ({ isActive }) => {
+      _appInForeground = !!isActive;
+      if (isActive) {
+        // App came to foreground — save heartbeat
+        localStorage.setItem('_aainik_heartbeat', String(Date.now()));
+        // Process any queued auto-responses that built up while killed
+        if (_pendingAutoQueue.length > 0 && !_queueProcessing) {
+          setTimeout(processAutoResponseQueue, 2000);
+        }
+      }
+    });
   }
+
+  // Also track via document visibility API (web fallback)
+  document.addEventListener('visibilitychange', () => {
+    _appInForeground = !document.hidden;
+    if (!document.hidden) {
+      localStorage.setItem('_aainik_heartbeat', String(Date.now()));
+    }
+  });
 
   // Init native notifications (permissions + channels + schedule)
   initCapacitorNotifications();
@@ -6137,12 +6349,29 @@ async function initCapacitorNotifications() {
       try { await LocalNotifications.createChannel(ch); } catch(e) {}
     }
 
-    // ── Handle notification tap → navigate to correct screen ──
+    // ── Handle notification tap → navigate to correct screen + tab ──
+    // Pre-scheduled Ego notifications → coach screen, Ego tab
+    // Pre-scheduled Josh notifications → coach screen, Josh tab
     try {
       LocalNotifications.addListener('localNotificationActionPerformed', (event) => {
         const extra = (event.notification && event.notification.extra) || {};
-        const screen = extra.screen || 'coach';
+        const screen   = extra.screen   || 'coach';
+        const convType = extra.convType || extra.type || '';
+
         if (typeof showScreen === 'function') showScreen(screen);
+
+        // Route to correct coach tab based on notification type
+        if (screen === 'coach' && typeof switchCoachTab === 'function') {
+          if (convType === 'josh_reminder' || convType === 'josh_auto') {
+            setTimeout(() => switchCoachTab('josh'), 400);
+          } else {
+            // ego_check, auto, or any other type → Ego tab
+            setTimeout(() => switchCoachTab('ego'), 400);
+          }
+        }
+
+        // Mark fresh heartbeat since user opened app via notification
+        try { localStorage.setItem('_aainik_heartbeat', String(Date.now())); } catch(e) {}
       });
     } catch(e) { console.warn('notif listener error:', e); }
 
@@ -6235,13 +6464,69 @@ async function scheduleAllCapacitorNotifications() {
         }
       });
 
-      // ── Ego AI auto-check: NO pre-scheduled notification ──
-      // Ego uses Gemini API to generate a real response — fireCapacitorNativeNotif()
-      // fires 1-2 min after trigger time once AI responds. Pre-scheduled static
-      // placeholders are intentionally removed so only the real AI notification appears.
+      // ── Ego AI auto-check: pre-scheduled PLACEHOLDER notifications ──
+      // These fire when app is KILLED so user gets an alert even without Gemini running.
+      // When user taps and opens app, the real Gemini response queue is triggered.
+      // When app is foreground: real AI response shown directly in UI (no notification).
+      // When app is background: real AI response fires as native notification instead.
+      if (appData.settings.autoCoachEnabled) {
+        const totalActiveTasks = (appData.tasks || []).filter(t => t.active !== false).length;
+        const todayStr = targetDate.getFullYear() + '-' + String(targetDate.getMonth()+1).padStart(2,'0') + '-' + String(targetDate.getDate()).padStart(2,'0');
+        const doneTodaySoFar = (appData.history || []).filter(h => h.date === todayStr && h.completed).length;
+        const pendingCount = Math.max(0, totalActiveTasks - doneTodaySoFar);
 
-      // ── Josh auto-reminder: NO pre-scheduled notification ──
-      // Josh uses Gemini API too — same reason as Ego above.
+        (appData.settings.autoCoachTimes || []).forEach((entry, idx) => {
+          if (!entry.enabled || !entry.time) return;
+          const [h, m] = entry.time.split(':').map(Number);
+          const fireAt = new Date(targetDate);
+          fireAt.setHours(h, m, 0, 0);
+          if (fireAt <= now) return;
+          const id = Math.abs((1000000 + dayOffset * 100 + idx) % 2100000000);
+          const fallbackBody = pendingCount > 0
+            ? `${pendingCount} task${pendingCount > 1 ? 's' : ''} abhi bhi pending ${pendingCount > 1 ? 'hain' : 'hai'}. App kholo — Ego tera full reality check dega!`
+            : `${doneTodaySoFar}/${totalActiveTasks} tasks done. App kholo — Ego tera progress report dega!`;
+          notifications.push({
+            id: id || (1000000 + dayOffset * 100 + idx + 1),
+            title: '🧠 Ego Check — Aainik',
+            body: fallbackBody,
+            channelId: 'aainik-ego',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground',
+            extra: { type: 'ego_check', time: entry.time, screen: 'coach', convType: 'ego_check' }
+          });
+        });
+      }
+
+      // ── Josh auto-reminder: pre-scheduled PLACEHOLDER notifications ──
+      // Same approach as Ego above — placeholder fires when app is killed.
+      if (appData.settings.joshAutoEnabled) {
+        (appData.settings.joshAutoTimes || []).forEach((entry, idx) => {
+          if (!entry.enabled || !entry.time) return;
+          const [h, m] = entry.time.split(':').map(Number);
+          const fireAt = new Date(targetDate);
+          fireAt.setHours(h, m, 0, 0);
+          if (fireAt <= now) return;
+          const id = Math.abs((2000000 + dayOffset * 100 + idx) % 2100000000);
+          const upcomingTasks = (appData.tasks || []).filter(t => {
+            if (!t.active) return false;
+            const wStart = t.workingWindowStart || t.scheduledTime || '00:00';
+            return wStart >= entry.time;
+          }).slice(0, 3);
+          const taskNames = upcomingTasks.map(t => t.name).join(', ');
+          const joshFallback = upcomingTasks.length > 0
+            ? `${upcomingTasks.length} task${upcomingTasks.length > 1 ? 's' : ''} aage hain: ${taskNames}. Josh motivational reminder ke saath aa raha hai!`
+            : `App kholo — Josh tera aaj ka ek personalized motivation dega!`;
+          notifications.push({
+            id: id || (2000000 + dayOffset * 100 + idx + 1),
+            title: '💪 Josh — Task Reminder',
+            body: joshFallback,
+            channelId: 'aainik-josh',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground',
+            extra: { type: 'josh_reminder', time: entry.time, screen: 'coach', convType: 'josh_reminder' }
+          });
+        });
+      }
     }
 
     if (notifications.length > 0) {
