@@ -230,7 +230,7 @@ async function checkAndFireEgoReports() {
       } catch (e) {
         console.warn('[SW] Weekly report failed:', e);
         await self.registration.showNotification('📊 Aainik — Weekly Report', {
-          body: 'App kholo — tera weekly performance report ready hai!',
+          body: 'Teri weekly performance report ready hai — app kholo aur dekho kahan khade ho is hafte!',
           icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
           tag: 'weekly-report-' + weekKey, renotify: true, data: { screen: 'coach' }
         }).catch(() => {});
@@ -248,7 +248,7 @@ async function checkAndFireEgoReports() {
       } catch (e) {
         console.warn('[SW] Daily progress failed:', e);
         await self.registration.showNotification('📈 Aainik — Daily Progress', {
-          body: 'App kholo — aaj ka overall progress report ready hai!',
+          body: 'Tera aaj ka overall progress report ready hai — app kholo aur full analysis dekho!',
           icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
           tag: 'daily-progress-' + today, renotify: true, data: { screen: 'coach' }
         }).catch(() => {});
@@ -270,7 +270,7 @@ async function checkAndFireEgoReports() {
       } catch (e) {
         console.warn('[SW] Auto-coach failed:', e);
         await self.registration.showNotification('🤖 Aainik — Ego Check', {
-          body: 'App kholo — auto ego check time!',
+          body: 'Ego check time! App kholo — aaj ke tasks ka full AI analysis milega.',
           icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
           tag: 'auto-coach-' + entry.time, renotify: true, data: { screen: 'coach' }
         }).catch(() => {});
@@ -279,10 +279,10 @@ async function checkAndFireEgoReports() {
   }
 }
 
-/* ─── SW helper: show AI notification with 2-3 line summary + Read Full action ─── */
+/* ─── SW helper: show AI notification with 4-5 line summary + Read Full action ─── */
 async function swShowAiNotification(title, fullBody, tag, convType) {
   const lines   = (fullBody || '').split('\n').filter(l => l.trim().length > 0);
-  const summary = lines.slice(0, 3).join('\n').substring(0, 280) || (fullBody || '').substring(0, 280);
+  const summary = lines.slice(0, 4).join('\n').substring(0, 450) || (fullBody || '').substring(0, 450);
   await self.registration.showNotification(title, {
     body: summary, icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
     tag, renotify: true, requireInteraction: false,
