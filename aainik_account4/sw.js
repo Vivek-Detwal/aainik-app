@@ -81,15 +81,23 @@ self.addEventListener('push', event => {
   } catch (e) { console.warn('[SW] Push error:', e); }
 });
 
-/* ─── NOTIFICATION CLICK: open app ─── */
+/* ─── NOTIFICATION CLICK: open app and route to correct screen ─── */
 self.addEventListener('notificationclick', event => {
   event.notification.close();
+  const data   = event.notification.data || {};
+  const screen = data.screen || '';
+
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then(clientList => {
       for (const client of clientList) {
-        if ('focus' in client) return client.focus();
+        if ('focus' in client) {
+          // Tell the app to navigate to the right screen
+          if (screen) client.postMessage({ type: 'NAVIGATE_SCREEN', screen });
+          return client.focus();
+        }
       }
-      return clients.openWindow('/index.html');
+      // App not open — open it, screen stored in hash for pickup on init
+      return clients.openWindow('/index.html' + (screen ? '#nav-' + screen : ''));
     })
   );
 });
@@ -192,8 +200,8 @@ function swShouldFireToday(n, dayOfWeek, isWeekday, isWeekend) {
 
 /* ─────────────────────────────────────────────
    SW: CHECK & FIRE EGO AI REPORTS (background)
-   Weekly report + Daily progress report
-   These fire Gemini API from SW when app is killed
+   Weekly + Daily Progress + Auto-coach
+   Calls Gemini API directly — sends real AI responses in notification
 ───────────────────────────────────────────── */
 async function checkAndFireEgoReports() {
   let appData = null;
@@ -201,10 +209,7 @@ async function checkAndFireEgoReports() {
     const cache = await caches.open('aainik-data');
     const resp  = await cache.match('/sw-data');
     if (resp) appData = await resp.json();
-  } catch (e) {
-    console.warn('[SW] Could not read app data:', e);
-    return;
-  }
+  } catch (e) { console.warn('[SW] Could not read app data:', e); return; }
   if (!appData || !appData.settings) return;
 
   const apiKey = appData.settings.coachApiKey;
@@ -212,38 +217,42 @@ async function checkAndFireEgoReports() {
 
   const now   = new Date();
   const hhmm  = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
-  const today = now.getFullYear() + '-' +
-                String(now.getMonth()+1).padStart(2,'0') + '-' +
-                String(now.getDate()).padStart(2,'0');
+  const today = now.getFullYear() + '-' + String(now.getMonth()+1).padStart(2,'0') + '-' + String(now.getDate()).padStart(2,'0');
 
-  // ── Weekly report check ──
+  // ── Weekly report ──
   if (appData.settings.weeklyReportEnabled && appData.settings.weeklyReportTime === hhmm) {
     const weekKey = swGetISOWeekKey(now);
-    const fired   = appData.settings.lastWeeklyReportFired || {};
-    if (!fired[weekKey]) {
+    if (!((appData.settings.lastWeeklyReportFired || {})[weekKey])) {
       try {
+        const r = await swCallGeminiForWeekly(appData, apiKey, now, today);
+        await swSaveReportToCache(appData, { type: 'weekly', weekKey, today, fullResponse: r.fullResponse, headline: r.headline });
+        await swShowAiNotification('📊 ' + r.headline, r.notifBody, 'weekly-report-' + weekKey, 'weekly');
+      } catch (e) {
+        console.warn('[SW] Weekly report failed:', e);
         await self.registration.showNotification('📊 Aainik — Weekly Report', {
-          body: 'Tera weekly performance report ready hai! App kholo.',
+          body: 'App kholo — tera weekly performance report ready hai!',
           icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
-          tag: 'weekly-report-' + weekKey, renotify: true,
-          data: { screen: 'coach' }
-        });
-      } catch (e) { console.warn('[SW] Weekly notif failed:', e); }
+          tag: 'weekly-report-' + weekKey, renotify: true, data: { screen: 'coach' }
+        }).catch(() => {});
+      }
     }
   }
 
-  // ── Daily progress report check ──
+  // ── Daily progress report ──
   if (appData.settings.dailyProgressEnabled && appData.settings.dailyProgressTime === hhmm) {
-    const fired = appData.settings.lastDailyProgressFired || {};
-    if (!fired[today]) {
+    if (!((appData.settings.lastDailyProgressFired || {})[today])) {
       try {
+        const r = await swCallGeminiForDaily(appData, apiKey, today);
+        await swSaveReportToCache(appData, { type: 'daily_progress', today, fullResponse: r.fullResponse, headline: r.headline });
+        await swShowAiNotification('📈 ' + r.headline, r.notifBody, 'daily-progress-' + today, 'daily_progress');
+      } catch (e) {
+        console.warn('[SW] Daily progress failed:', e);
         await self.registration.showNotification('📈 Aainik — Daily Progress', {
-          body: 'Aaj ka overall progress report ready hai! App kholo.',
+          body: 'App kholo — aaj ka overall progress report ready hai!',
           icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
-          tag: 'daily-progress-' + today, renotify: true,
-          data: { screen: 'coach' }
-        });
-      } catch (e) { console.warn('[SW] Daily progress notif failed:', e); }
+          tag: 'daily-progress-' + today, renotify: true, data: { screen: 'coach' }
+        }).catch(() => {});
+      }
     }
   }
 
@@ -253,18 +262,151 @@ async function checkAndFireEgoReports() {
     for (const entry of times) {
       if (!entry.enabled || entry.time !== hhmm) continue;
       const fireKey = today + '_' + entry.time;
-      const fired   = appData.settings.lastAutoCoachFired || {};
-      if (fired[fireKey]) continue;
+      if ((appData.settings.lastAutoCoachFired || {})[fireKey]) continue;
       try {
+        const r = await swCallGeminiForAutoCoach(appData, apiKey, today, entry.time);
+        await swSaveReportToCache(appData, { type: 'auto', fireKey, today, triggerTime: entry.time, fullResponse: r.fullResponse, headline: r.headline });
+        await swShowAiNotification(r.headline, r.notifBody, 'auto-coach-' + entry.time, 'auto');
+      } catch (e) {
+        console.warn('[SW] Auto-coach failed:', e);
         await self.registration.showNotification('🤖 Aainik — Ego Check', {
-          body: `Auto ego check time! App kholo.`,
+          body: 'App kholo — auto ego check time!',
           icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
-          tag: 'auto-coach-' + entry.time, renotify: true,
-          data: { screen: 'coach' }
-        });
-      } catch (e) { console.warn('[SW] Auto-coach notif failed:', e); }
+          tag: 'auto-coach-' + entry.time, renotify: true, data: { screen: 'coach' }
+        }).catch(() => {});
+      }
     }
   }
+}
+
+/* ─── SW helper: show AI notification with 2-3 line summary + Read Full action ─── */
+async function swShowAiNotification(title, fullBody, tag, convType) {
+  const lines   = (fullBody || '').split('\n').filter(l => l.trim().length > 0);
+  const summary = lines.slice(0, 3).join('\n').substring(0, 280) || (fullBody || '').substring(0, 280);
+  await self.registration.showNotification(title, {
+    body: summary, icon: '/icons/icon-192.png', badge: '/icons/icon-192.png',
+    tag, renotify: true, requireInteraction: false,
+    actions: [{ action: 'open-coach', title: '📖 Read Full' }],
+    data: { screen: 'coach', convType }
+  });
+}
+
+/* ─── SW helper: call Gemini API ─── */
+async function swCallGemini(apiKey, model, systemText, userText, maxTokens) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const resp = await fetch(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: systemText }] },
+      contents: [{ role: 'user', parts: [{ text: userText }] }],
+      generationConfig: { maxOutputTokens: maxTokens || 800, temperature: 0.85, thinkingConfig: { thinkingBudget: 0 } }
+    })
+  });
+  if (!resp.ok) throw new Error('Gemini ' + resp.status);
+  const data = await resp.json();
+  return (data.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('') || '';
+}
+
+function swBuildTone(personality, type) {
+  const p = personality || 'beast';
+  if (type === 'weekly') {
+    if (p === 'beast')    return 'Tu ek brutal honest Hinglish weekly coach hai. 7 din ka full reality check de.';
+    if (p === 'balanced') return 'Tu ek balanced Hinglish weekly coach hai. 7 din ka honest analysis de.';
+    return 'Tu ek encouraging Hinglish weekly coach hai. 7 din ki achievements celebrate kar.';
+  }
+  if (type === 'daily_progress') {
+    if (p === 'beast')    return 'Tu ek brutal reality-check Hinglish coach hai. Overall journey ka honest assessment de.';
+    if (p === 'balanced') return 'Tu ek balanced Hinglish coach hai. Overall progress pe honest view de.';
+    return 'Tu ek encouraging Hinglish coach hai. Journey celebrate karo, growth highlight karo.';
+  }
+  if (p === 'beast')    return 'Tu ek brutal no-excuse Hinglish coach hai. Harsh, sarcastic if needed.';
+  if (p === 'balanced') return 'Tu ek honest Hinglish coach hai. Direct but not cruel.';
+  return 'Tu ek encouraging Hinglish coach hai. Warm but real.';
+}
+
+function swGetDailyScore(appData, dateStr) {
+  const tasks = (appData.tasks || []).filter(t => t.active !== false);
+  const done  = (appData.history || []).filter(h => h.date === dateStr && h.completed).length;
+  return { score: tasks.length > 0 ? Math.round((done / tasks.length) * 100) : 0, done, total: tasks.length };
+}
+
+function swDateNDaysAgo(n) {
+  const d = new Date(); d.setDate(d.getDate() - n);
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+async function swCallGeminiForWeekly(appData, apiKey, now, today) {
+  const model = appData.settings.geminiModel || 'gemini-2.5-flash';
+  const personality = appData.settings.autoCoachPersonality || 'beast';
+  const last7 = [];
+  for (let i = 7; i >= 1; i--) { const d = swDateNDaysAgo(i); const ds = swGetDailyScore(appData, d); last7.push({ date: d, score: ds.score, done: ds.done, total: ds.total }); }
+  const avgWeekly = last7.length ? Math.round(last7.reduce((a, b) => a + b.score, 0) / last7.length) : 0;
+  const lifeGoals = (appData.settings.egoLifeGoals || '').trim();
+  const negWords  = (appData.settings.egoNegativeWords || '').trim();
+  const sysText   = swBuildTone(personality, 'weekly') + (lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '') + (negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '');
+  const userText  = `WEEKLY REPORT MODE:\nWeekly Average: ${avgWeekly}%\nLast 7 days:\n${last7.map(d => `${d.date}: ${d.score}% (${d.done}/${d.total})`).join('\n')}\n\nIs 7 din ka full reality check de. Pattern dekh. Next hafte ke liye 2-3 actionable goals bata.\nFormat:\nLine 1: Ek punchy headline (max 90 chars, Hinglish, personal)\nBlank line\nFull weekly reality check response`;
+  const raw = await swCallGemini(apiKey, model, sysText, userText, 800);
+  const lines = raw.trim().split('\n').filter(l => l.trim());
+  return { headline: lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📊 Weekly Report', notifBody: lines.slice(1).join('\n').trim() || raw.trim(), fullResponse: raw };
+}
+
+async function swCallGeminiForDaily(appData, apiKey, today) {
+  const model = appData.settings.geminiModel || 'gemini-2.5-flash';
+  const personality = appData.settings.autoCoachPersonality || 'beast';
+  const allDates = [...new Set((appData.history || []).map(h => h.date))].sort().filter(d => d < today);
+  const scores   = allDates.map(d => swGetDailyScore(appData, d).score);
+  const avg      = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+  const best     = scores.length ? Math.max(...scores) : 0;
+  const worst    = scores.length ? Math.min(...scores) : 0;
+  const lifeGoals = (appData.settings.egoLifeGoals || '').trim();
+  const negWords  = (appData.settings.egoNegativeWords || '').trim();
+  const sysText   = swBuildTone(personality, 'daily_progress') + (lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '') + (negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '');
+  const userText  = `OVERALL PROGRESS REPORT:\nTotal days: ${allDates.length} | Avg: ${avg}% | Best: ${best}% | Worst: ${worst}% | Started: ${allDates[0] || 'N/A'}\n\nPoori journey ka honest assessment de. Specific numbers use kar.\nFormat:\nLine 1: Ek punchy headline (max 90 chars)\nBlank line\nFull overall progress reality check`;
+  const raw = await swCallGemini(apiKey, model, sysText, userText, 800);
+  const lines = raw.trim().split('\n').filter(l => l.trim());
+  return { headline: lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Progress Report', notifBody: lines.slice(1).join('\n').trim() || raw.trim(), fullResponse: raw };
+}
+
+async function swCallGeminiForAutoCoach(appData, apiKey, today, triggerTime) {
+  const model = appData.settings.geminiModel || 'gemini-2.5-flash';
+  const personality = appData.settings.autoCoachPersonality || 'beast';
+  const tasks = (appData.tasks || []).filter(t => t.active !== false);
+  const lifeGoals = (appData.settings.egoLifeGoals || '').trim();
+  const negWords  = (appData.settings.egoNegativeWords || '').trim();
+  const tasksDue  = tasks.filter(t => (t.workingWindowStart || t.scheduledTime || '00:00') <= triggerTime).map(t => {
+    const entry = (appData.history || []).find(h => h.taskId === t.id && h.date === today);
+    const done  = entry && entry.completed;
+    const cat   = (appData.categories || []).find(c => c.id === t.categoryId);
+    const wEnd  = t.workingWindowEnd || '';
+    return { name: t.name, category: cat ? cat.name : '', completed: !!done, effortScore: done && entry ? (entry.effortScore || 0) : 0, isUntracked: !done && !!wEnd && wEnd <= triggerTime, isPending: !done && !!wEnd && wEnd > triggerTime, whyMatters: t.whyMatters || '', window: `${t.workingWindowStart || t.scheduledTime || '?'}→${wEnd || '?'}` };
+  });
+  const doneCount = tasksDue.filter(t => t.completed).length;
+  const sysText   = swBuildTone(personality, 'auto') + (lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '') + (negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '');
+  const taskLines = tasksDue.map(t => `• [${t.category}] ${t.name} — ${t.completed ? `✅ DONE (effort ${t.effortScore}/10)` : t.isUntracked ? `⚠️ UNTRACKED` : t.isPending ? `⏳ PENDING` : `❌ NOT DONE`} | Window: ${t.window} | Why: ${t.whyMatters}`).join('\n') || 'Koi task due nahi';
+  const userText  = `AUTO CHECK TIME: ${triggerTime}\nTasks due by now:\n${taskLines}\nSummary: ${doneCount}/${tasksDue.length} done\n\nFormat:\nLine 1: Ek punchy headline (max 90 chars, Hinglish, personal)\nBlank line\nFull detailed reality check (task-by-task, efforts, goals connect)`;
+  const raw = await swCallGemini(apiKey, model, sysText, userText, 800);
+  const lines = raw.trim().split('\n').filter(l => l.trim());
+  return { headline: lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Ego ka check!', notifBody: lines.slice(1).join('\n').trim() || raw.trim(), fullResponse: raw };
+}
+
+/* ─── SW helper: save fired flag + conversation to cached appData ─── */
+async function swSaveReportToCache(appData, opts) {
+  try {
+    const s = appData.settings;
+    if (opts.type === 'weekly'   && opts.weekKey) { if (!s.lastWeeklyReportFired)   s.lastWeeklyReportFired   = {}; s.lastWeeklyReportFired[opts.weekKey]   = true; }
+    if (opts.type === 'daily_progress' && opts.today) { if (!s.lastDailyProgressFired) s.lastDailyProgressFired = {}; s.lastDailyProgressFired[opts.today]   = true; }
+    if (opts.type === 'auto'     && opts.fireKey) { if (!s.lastAutoCoachFired)      s.lastAutoCoachFired      = {}; s.lastAutoCoachFired[opts.fireKey]      = true; }
+    if (!appData.conversations) appData.conversations = [];
+    appData.conversations.unshift({
+      id: 'conv_sw_' + opts.type + '_' + Date.now(), type: opts.type,
+      timestamp: Date.now(), date: opts.today || '', triggerTime: opts.triggerTime || '',
+      response: opts.fullResponse || '', headline: opts.headline || '',
+      scoreLabel: opts.type === 'weekly' ? '📊 Weekly Report (background)' : opts.type === 'daily_progress' ? '📈 Daily Progress (background)' : `🤖 Auto Check — ${opts.triggerTime || ''} (background)`
+    });
+    if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
+    const cache = await caches.open('aainik-data');
+    await cache.put('/sw-data', new Response(JSON.stringify(appData), { headers: { 'Content-Type': 'application/json' } }));
+  } catch (e) { console.warn('[SW] Could not save report to cache:', e); }
 }
 
 function swGetISOWeekKey(date) {
