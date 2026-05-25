@@ -2508,8 +2508,16 @@ INSTRUCTIONS:
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Josh: Aaj ke tasks yaad hain? 💪';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
-  fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
+  // Fire notification — 4-5 line AI summary in notification body
+  // On Android Capacitor: use LocalNotifications so actual AI content is visible
+  // On web: fall back to standard Web Notification API
+  const capFiredJosh = await fireCapacitorNativeNotif(
+    '💪 ' + headline,
+    notifBody,
+    'aainik-josh',
+    'josh_auto'
+  );
+  if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
 
   // Save to joshConversations
   if (!appData.joshConversations) appData.joshConversations = [];
@@ -3800,8 +3808,16 @@ Full detailed reality check response (task-by-task analysis, working window, eff
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Ego ka check — dekho!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
-  fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
+  // Fire notification — 4-5 line AI summary in notification body
+  // On Android Capacitor: use LocalNotifications so actual AI content is visible
+  // On web: fall back to standard Web Notification API
+  const capFiredEgo = await fireCapacitorNativeNotif(
+    '🧠 ' + headline,
+    notifBody,
+    'aainik-ego',
+    'auto'
+  );
+  if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
 
   // Save to conversation history
   if (!appData.conversations) appData.conversations = [];
@@ -4004,22 +4020,67 @@ function updateDailyProgressTime(val) {
 ───────────────────────────────────────────── */
 function extractNotifSummary(text, maxLines) {
   if (!text) return '';
-  maxLines = maxLines || 3;
+  maxLines = maxLines || 4;
   // Split by newlines, filter blanks
   const lines = text.split('\n').filter(l => l.trim().length > 0);
-  if (lines.length <= maxLines) return text.substring(0, 300);
-  return lines.slice(0, maxLines).join('\n').substring(0, 300);
+  if (lines.length <= maxLines) return text.substring(0, 450);
+  return lines.slice(0, maxLines).join('\n').substring(0, 450);
+}
+
+/* ─────────────────────────────────────────────
+   fireCapacitorNativeNotif — fires a native Android notification via
+   Capacitor LocalNotifications with actual AI summary in the body.
+   Used on Android APK so the dynamic AI response appears in the
+   notification instead of the pre-scheduled static placeholder text.
+   Returns true if Capacitor path was used, false if not on native.
+───────────────────────────────────────────── */
+async function fireCapacitorNativeNotif(title, fullResponse, channelId, convType) {
+  if (typeof window.Capacitor === 'undefined') return false;
+  if (!window.Capacitor.isNativePlatform || !window.Capacitor.isNativePlatform()) return false;
+  const { LocalNotifications } = (window.Capacitor.Plugins) || {};
+  if (!LocalNotifications) return false;
+  try {
+    const fireAt = new Date(Date.now() + 400);
+    // Use high ID range (5M+) to avoid collisions with pre-scheduled notifications
+    const notifId = 5000000 + (Date.now() % 999999);
+
+    // ── Collapsed preview (2 lines ~150 chars) shown immediately ──
+    const _lines = (fullResponse || '').split('\n').filter(l => l.trim().length > 0);
+    const previewBody = _lines.slice(0, 2).join('\n').substring(0, 150) || (fullResponse || '').substring(0, 150);
+
+    // ── Expanded full text (BigTextStyle — up to 1200 chars) ──
+    // User swipes down on notification to expand — like Gmail shows full email.
+    // No need to open the app to read the AI response.
+    const expandedBody = (fullResponse || '').replace(/[*_#]/g, '').trim().substring(0, 1200);
+
+    await LocalNotifications.schedule({ notifications: [{
+      id: notifId,
+      title: title,
+      body: previewBody,
+      largeBody: expandedBody,
+      summaryText: 'App mein full history ke liye tap karo',
+      channelId: channelId || 'aainik-ego',
+      schedule: { at: fireAt, allowWhileIdle: true },
+      smallIcon: 'ic_launcher_foreground',
+      extra: { type: convType || 'auto', screen: 'coach', convType: convType || 'auto' }
+    }]});
+    return true;
+  } catch (e) {
+    console.warn('Capacitor native notif error:', e);
+    return false;
+  }
 }
 
 /* ─────────────────────────────────────────────
    fireAiNotification — standard helper to fire all AI report notifications
-   - body = 2-3 line summary
+   - body = 4-5 line AI summary
    - "📖 Read Full" action opens app to coach screen
    - full response saved in data for routing
+   NOTE: On Android Capacitor, use fireCapacitorNativeNotif first.
 ───────────────────────────────────────────── */
 function fireAiNotification(title, fullResponse, tag, convType) {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
-  const summaryBody = extractNotifSummary(fullResponse, 3);
+  const summaryBody = extractNotifSummary(fullResponse, 4);
   const opts = {
     body: summaryBody,
     icon: 'icons/icon-192.png',
@@ -4138,8 +4199,14 @@ async function runWeeklyReport() {
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📊 Tera-Ego Weekly Report!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
-  fireAiNotification(headline, notifBody, 'weekly-report-' + getISOWeekKey(new Date()), 'weekly');
+  // Fire notification — 4-5 line AI summary in notification body
+  const capFiredWeekly = await fireCapacitorNativeNotif(
+    '📊 ' + headline,
+    notifBody,
+    'aainik-ego',
+    'weekly'
+  );
+  if (!capFiredWeekly) fireAiNotification(headline, notifBody, 'weekly-report-' + getISOWeekKey(new Date()), 'weekly');
 
   // Save to conversations
   if (!appData.conversations) appData.conversations = [];
@@ -4228,8 +4295,14 @@ async function runDailyProgressReport() {
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Tera-Ego Progress Report!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
-  fireAiNotification(headline, notifBody, 'daily-progress-' + today, 'daily_progress');
+  // Fire notification — 4-5 line AI summary in notification body
+  const capFiredDaily = await fireCapacitorNativeNotif(
+    '📈 ' + headline,
+    notifBody,
+    'aainik-ego',
+    'daily_progress'
+  );
+  if (!capFiredDaily) fireAiNotification(headline, notifBody, 'daily-progress-' + today, 'daily_progress');
 
   if (!appData.conversations) appData.conversations = [];
   appData.conversations.unshift({
@@ -6064,6 +6137,15 @@ async function initCapacitorNotifications() {
       try { await LocalNotifications.createChannel(ch); } catch(e) {}
     }
 
+    // ── Handle notification tap → navigate to correct screen ──
+    try {
+      LocalNotifications.addListener('localNotificationActionPerformed', (event) => {
+        const extra = (event.notification && event.notification.extra) || {};
+        const screen = extra.screen || 'coach';
+        if (typeof showScreen === 'function') showScreen(screen);
+      });
+    } catch(e) { console.warn('notif listener error:', e); }
+
     await scheduleAllCapacitorNotifications();
 
   } catch(e) {
@@ -6155,6 +6237,12 @@ async function scheduleAllCapacitorNotifications() {
 
       // ── Ego AI auto-check notifications ──
       if (appData.settings.autoCoachEnabled) {
+        // Build a quick pending task count for this slot (used as fallback text when AI hasn't run yet)
+        const totalActiveTasks = (appData.tasks || []).filter(t => t.active !== false).length;
+        const todayStr = targetDate.getFullYear() + '-' + String(targetDate.getMonth()+1).padStart(2,'0') + '-' + String(targetDate.getDate()).padStart(2,'0');
+        const doneTodaySoFar = (appData.history || []).filter(h => h.date === todayStr && h.completed).length;
+        const pendingCount = Math.max(0, totalActiveTasks - doneTodaySoFar);
+
         (appData.settings.autoCoachTimes || []).forEach((entry, idx) => {
           if (!entry.enabled || !entry.time) return;
           const [h, m] = entry.time.split(':').map(Number);
@@ -6162,14 +6250,17 @@ async function scheduleAllCapacitorNotifications() {
           fireAt.setHours(h, m, 0, 0);
           if (fireAt <= now) return;
           const id = Math.abs((1000000 + dayOffset * 100 + idx) % 2100000000);
+          const fallbackBody = pendingCount > 0
+            ? `${pendingCount} task${pendingCount > 1 ? 's' : ''} abhi bhi pending ${pendingCount > 1 ? 'hain' : 'hai'}. App kholo — Ego tera full reality check dega!`
+            : `${doneTodaySoFar}/${totalActiveTasks} tasks done. App kholo — Ego tera progress report dega!`;
           notifications.push({
             id: id || (1000000 + dayOffset * 100 + idx + 1),
             title: '🧠 Ego Check — Aainik',
-            body: 'Time: ' + entry.time + ' — App kholo, Ego tera report dega!',
+            body: fallbackBody,
             channelId: 'aainik-ego',
             schedule: { at: fireAt, allowWhileIdle: true },
             smallIcon: 'ic_launcher_foreground',
-            extra: { type: 'ego_check', time: entry.time }
+            extra: { type: 'ego_check', time: entry.time, screen: 'coach' }
           });
         });
       }
@@ -6183,14 +6274,24 @@ async function scheduleAllCapacitorNotifications() {
           fireAt.setHours(h, m, 0, 0);
           if (fireAt <= now) return;
           const id = Math.abs((2000000 + dayOffset * 100 + idx) % 2100000000);
+          // Build a data-driven fallback text — upcoming tasks after this time slot
+          const upcomingTasks = (appData.tasks || []).filter(t => {
+            if (!t.active) return false;
+            const wStart = t.workingWindowStart || t.scheduledTime || '00:00';
+            return wStart >= entry.time;
+          }).slice(0, 3);
+          const taskNames = upcomingTasks.map(t => t.name).join(', ');
+          const joshFallback = upcomingTasks.length > 0
+            ? `${upcomingTasks.length} task${upcomingTasks.length > 1 ? 's' : ''} aage hain: ${taskNames}. Josh motivational reminder ke saath aa raha hai!`
+            : `App kholo — Josh tera aaj ka ek personalized motivation dega!`;
           notifications.push({
             id: id || (2000000 + dayOffset * 100 + idx + 1),
             title: '💪 Josh — Task Reminder',
-            body: 'Josh: Upcoming tasks yaad hain? Chal shuru karte hain! 🔥',
+            body: joshFallback,
             channelId: 'aainik-josh',
             schedule: { at: fireAt, allowWhileIdle: true },
             smallIcon: 'ic_launcher_foreground',
-            extra: { type: 'josh_reminder', time: entry.time }
+            extra: { type: 'josh_reminder', time: entry.time, screen: 'coach' }
           });
         });
       }
