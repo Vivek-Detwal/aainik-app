@@ -2502,20 +2502,8 @@ INSTRUCTIONS:
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Josh: Aaj ke tasks yaad hain? 💪';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — title = headline, body = full response
-  if ('Notification' in window && Notification.permission === 'granted') {
-    const opts = {
-      body: notifBody,
-      icon: 'icons/icon-192.png',
-      tag: 'josh-auto-' + triggerTime,
-      renotify: true
-    };
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => reg.showNotification(headline, opts)).catch(() => {});
-    } else {
-      try { new Notification(headline, opts); } catch (e) {}
-    }
-  }
+  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
+  fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
 
   // Save to joshConversations
   if (!appData.joshConversations) appData.joshConversations = [];
@@ -3664,27 +3652,8 @@ Full detailed reality check response (task-by-task analysis, working window, eff
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Tera-Ego ka check — dekho!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire browser notification — title = headline, body = full response
-  if ('Notification' in window && Notification.permission === 'granted') {
-    const coachOpts = {
-      body: notifBody,
-      icon: 'icons/icon-192.png',
-      tag: 'auto-coach-' + triggerTime,
-      renotify: true
-    };
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => {
-        reg.showNotification(headline, coachOpts);
-      }).catch(e => console.warn('Notification failed (SW):', e));
-    } else {
-      try {
-        const n = new Notification(headline, coachOpts);
-        n.onclick = () => { window.focus(); showScreen('coach'); };
-      } catch (e) {
-        console.warn('Notification failed:', e);
-      }
-    }
-  }
+  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
+  fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
 
   // Save to conversation history
   if (!appData.conversations) appData.conversations = [];
@@ -3855,6 +3824,8 @@ function toggleWeeklyReport(val) {
   appData.settings.weeklyReportEnabled = val;
   saveData();
   showToast(val ? '✅ Weekly report ON' : '🔕 Weekly report OFF');
+  // If enabling and already past today's configured time, fire catch-up immediately
+  if (val) setTimeout(checkMissedReports, 500);
 }
 
 function updateWeeklyReportTime(val) {
@@ -3866,6 +3837,8 @@ function toggleDailyProgress(val) {
   appData.settings.dailyProgressEnabled = val;
   saveData();
   showToast(val ? '✅ Daily progress report ON' : '🔕 Daily progress report OFF');
+  // If enabling and already past today's configured time, fire catch-up immediately
+  if (val) setTimeout(checkMissedReports, 500);
 }
 
 function updateDailyProgressTime(val) {
@@ -3877,6 +3850,92 @@ function updateDailyProgressTime(val) {
    EGO AI MODE: WEEKLY REPORT TRIGGER
    Fires every 7 days at the configured time
 ───────────────────────────────────────────── */
+/* ─────────────────────────────────────────────
+   extractNotifSummary — 2-3 line summary for notification body
+   Full response is saved in chat history; user can "Read Full" via app
+───────────────────────────────────────────── */
+function extractNotifSummary(text, maxLines) {
+  if (!text) return '';
+  maxLines = maxLines || 3;
+  // Split by newlines, filter blanks
+  const lines = text.split('\n').filter(l => l.trim().length > 0);
+  if (lines.length <= maxLines) return text.substring(0, 300);
+  return lines.slice(0, maxLines).join('\n').substring(0, 300);
+}
+
+/* ─────────────────────────────────────────────
+   fireAiNotification — standard helper to fire all AI report notifications
+   - body = 2-3 line summary
+   - "📖 Read Full" action opens app to coach screen
+   - full response saved in data for routing
+───────────────────────────────────────────── */
+function fireAiNotification(title, fullResponse, tag, convType) {
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+  const summaryBody = extractNotifSummary(fullResponse, 3);
+  const opts = {
+    body: summaryBody,
+    icon: 'icons/icon-192.png',
+    badge: 'icons/icon-192.png',
+    tag: tag,
+    renotify: true,
+    requireInteraction: false,
+    actions: [{ action: 'open-coach', title: '📖 Read Full' }],
+    data: { screen: 'coach', convType: convType || 'auto' }
+  };
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    navigator.serviceWorker.ready
+      .then(reg => reg.showNotification(title, opts))
+      .catch(e => console.warn('Notification failed (SW):', e));
+  } else {
+    try {
+      const n = new Notification(title, opts);
+      n.onclick = () => { window.focus(); showScreen('coach'); };
+    } catch (e) {
+      console.warn('Notification failed:', e);
+    }
+  }
+}
+
+/* ─────────────────────────────────────────────
+   checkMissedReports — catch-up for weekly/daily reports
+   Called on app init: if a report was supposed to fire today/this week
+   but the app was closed at that time, fire it now.
+───────────────────────────────────────────── */
+function checkMissedReports() {
+  if (!appData.settings.coachApiKey) return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+
+  const now    = new Date();
+  const hhmm   = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+  const today  = getTodayStr();
+  const s      = appData.settings;
+
+  // ── Weekly report catch-up ──
+  if (s.weeklyReportEnabled && s.weeklyReportTime && hhmm >= s.weeklyReportTime) {
+    const weekKey = getISOWeekKey(now);
+    if (!s.lastWeeklyReportFired || !s.lastWeeklyReportFired[weekKey]) {
+      if (!s.lastWeeklyReportFired) s.lastWeeklyReportFired = {};
+      s.lastWeeklyReportFired[weekKey] = true;
+      saveData();
+      setTimeout(() => {
+        runWeeklyReport().catch(err => console.warn('Weekly catch-up failed:', err.message));
+      }, 4000);
+    }
+  }
+
+  // ── Daily progress catch-up ──
+  if (s.dailyProgressEnabled && s.dailyProgressTime && hhmm >= s.dailyProgressTime) {
+    if (!s.lastDailyProgressFired || !s.lastDailyProgressFired[today]) {
+      if (!s.lastDailyProgressFired) s.lastDailyProgressFired = {};
+      s.lastDailyProgressFired[today] = true;
+      saveData();
+      setTimeout(() => {
+        runDailyProgressReport().catch(err => console.warn('Daily progress catch-up failed:', err.message));
+      }, 7000);
+    }
+  }
+}
+
 function checkWeeklyReportTrigger(hhmm) {
   const s = appData.settings;
   if (!s.weeklyReportEnabled) return;
@@ -3931,18 +3990,8 @@ async function runWeeklyReport() {
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📊 Tera-Ego Weekly Report!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — title = headline, body = full response
-  if ('Notification' in window && Notification.permission === 'granted') {
-    const opts = {
-      body: notifBody, icon: 'icons/icon-192.png',
-      tag: 'weekly-report-' + getISOWeekKey(new Date()), renotify: true
-    };
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => reg.showNotification(headline, opts));
-    } else {
-      try { new Notification(headline, opts); } catch (e) {}
-    }
-  }
+  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
+  fireAiNotification(headline, notifBody, 'weekly-report-' + getISOWeekKey(new Date()), 'weekly');
 
   // Save to conversations
   if (!appData.conversations) appData.conversations = [];
@@ -4031,17 +4080,8 @@ async function runDailyProgressReport() {
   const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Tera-Ego Progress Report!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  if ('Notification' in window && Notification.permission === 'granted') {
-    const opts = {
-      body: notifBody, icon: 'icons/icon-192.png',
-      tag: 'daily-progress-' + today, renotify: true
-    };
-    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
-      navigator.serviceWorker.ready.then(reg => reg.showNotification(headline, opts));
-    } else {
-      try { new Notification(headline, opts); } catch (e) {}
-    }
-  }
+  // Fire notification — 2-3 line summary shown; "Read Full" opens app to full response in chat history
+  fireAiNotification(headline, notifBody, 'daily-progress-' + today, 'daily_progress');
 
   if (!appData.conversations) appData.conversations = [];
   appData.conversations.unshift({
@@ -4836,6 +4876,12 @@ function checkNotifications() {
   const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
   const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
 
+  // ── AI Reports (Ego Auto, Josh Auto, Weekly, Daily Progress) ──
+  // These run OUTSIDE the notification window gate — they have their own time configs
+  checkAutoCoachTriggers(hhmm);
+  checkJoshAutoTriggers(hhmm);
+
+  // ── Task reminders — respect notification window ──
   const notifWindow = appData.settings;
   const fromStr = notifWindow.notifWindowFrom || '06:00';
   const toStr   = notifWindow.notifWindowTo   || '23:00';
@@ -4871,12 +4917,6 @@ function checkNotifications() {
       fireNotificationWithTag(task.name, n.message, task.id, n.id);
     });
   });
-
-  // Account 5: Auto-coach trigger check
-  checkAutoCoachTriggers(hhmm);
-
-  // Account 4 (Josh): Josh auto reminder check
-  checkJoshAutoTriggers(hhmm);
 
   // Account 2: Working window expiry check
   checkWorkingWindowExpiry();
@@ -5399,6 +5439,21 @@ function registerServiceWorker() {
     }).catch(err => {
       console.warn('SW registration failed:', err);
     });
+
+    // Handle SW messages — e.g. navigate to coach screen when "Read Full" is tapped
+    navigator.serviceWorker.addEventListener('message', event => {
+      if (!event.data) return;
+      if (event.data.type === 'NAVIGATE_SCREEN' && event.data.screen) {
+        showScreen(event.data.screen);
+      }
+    });
+
+    // Handle hash navigation from notification click (when app was closed)
+    if (location.hash && location.hash.startsWith('#nav-')) {
+      const targetScreen = location.hash.replace('#nav-', '');
+      setTimeout(() => showScreen(targetScreen), 500);
+      history.replaceState(null, '', location.pathname);
+    }
   }
 }
 
@@ -5466,6 +5521,9 @@ function initApp() {
 
   // Account 5: Capacitor Android init (runs only inside native APK, no-op in browser)
   setTimeout(initCapacitorAndroid, 1200);
+
+  // Catch-up: fire weekly/daily reports if they were scheduled while app was closed
+  setTimeout(checkMissedReports, 5000);
 }
 
 // Start the app
