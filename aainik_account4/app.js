@@ -200,6 +200,9 @@ function getDefaultData() {
       notifWindowFrom: '06:00',
       notifWindowTo: '23:00',
       coachApiKey: '',
+      coachApiKey2: '',           // 2nd Gemini API key (auto-switched when key1 hits limit)
+      coachApiKey3: '',           // 3rd Gemini API key (auto-switched when key2 hits limit)
+      apiKeyStats: {},            // per-key RPD/RPM usage tracker for smart switching
       coachProvider: 'gemini',
       geminiModel: 'gemini-2.5-flash',      // 'gemini-2.5-flash' | 'gemini-2.0-flash'
       geminiSearchEnabled: true,             // Enable Google Search grounding
@@ -377,6 +380,9 @@ function migrateData(old) {
   if (merged.settings.coachProvider === 'groq') merged.settings.coachProvider = 'gemini';
   if (!merged.settings.geminiModel)             merged.settings.geminiModel   = 'gemini-2.5-flash';
   if (merged.settings.geminiSearchEnabled === undefined) merged.settings.geminiSearchEnabled = true;
+  if (merged.settings.coachApiKey2 === undefined) merged.settings.coachApiKey2 = '';
+  if (merged.settings.coachApiKey3 === undefined) merged.settings.coachApiKey3 = '';
+  if (!merged.settings.apiKeyStats)              merged.settings.apiKeyStats   = {};
 
   // Ego AI Mode: ensure auto-coach fields exist in settings
   if (merged.settings.autoCoachEnabled === undefined)  merged.settings.autoCoachEnabled  = false;
@@ -2527,7 +2533,7 @@ INSTRUCTIONS:
 function checkJoshAutoTriggers(hhmm) {
   const s = appData.settings;
   if (!s.joshAutoEnabled) return;
-  if (!s.coachApiKey) return; // reuse same API key
+  if (!hasAnyApiKey()) return; // need at least one API key
 
   const times = s.joshAutoTimes || [];
   times.forEach(entry => {
@@ -2552,8 +2558,8 @@ async function joshManualChat(userMessage, daysCount) {
     showToast('⚠️ Kuch toh likho pehle!');
     return;
   }
-  const apiKey = appData.settings.coachApiKey;
-  if (!apiKey) {
+  const apiKey = (getAvailableApiKey() || {}).key || appData.settings.coachApiKey;
+  if (!hasAnyApiKey()) {
     showToast('⚠️ API key missing! Settings mein set karo.');
     showScreen('settings');
     return;
@@ -3010,8 +3016,7 @@ function cyclePersonality() {
    EGO AI MODE — GEMINI API CALL
 ───────────────────────────────────────────── */
 async function talkToCoach() {
-  const apiKey = appData.settings.coachApiKey;
-  if (!apiKey) {
+  if (!hasAnyApiKey()) {
     showToast('⚠️ API key missing! Settings mein set karo.', 3000);
     showScreen('settings');
     scrollToCoachConfig();
@@ -3266,6 +3271,11 @@ function renderCoachSettings() {
   // API key (masked display)
   const keyInp = document.getElementById('coach-api-key-input');
   if (keyInp && s.coachApiKey) keyInp.value = s.coachApiKey;
+  const keyInp2 = document.getElementById('coach-api-key-input-2');
+  if (keyInp2) keyInp2.value = s.coachApiKey2 || '';
+  const keyInp3 = document.getElementById('coach-api-key-input-3');
+  if (keyInp3) keyInp3.value = s.coachApiKey3 || '';
+  refreshApiKeyStats();
 
   // Gemini model selector
   const modelSel = document.getElementById('gemini-model-select');
@@ -3312,6 +3322,19 @@ function updateCoachApiKey(val) {
   // Hide no-key banner on coach screen if present
   const banner = document.getElementById('coach-no-key-banner');
   if (banner) banner.classList.toggle('hidden', !!val.trim());
+  refreshApiKeyStats();
+}
+
+function updateCoachApiKey2(val) {
+  appData.settings.coachApiKey2 = val.trim();
+  saveData();
+  refreshApiKeyStats();
+}
+
+function updateCoachApiKey3(val) {
+  appData.settings.coachApiKey3 = val.trim();
+  saveData();
+  refreshApiKeyStats();
 }
 
 function updateGeminiModel(val) {
@@ -3367,8 +3390,9 @@ function resetCoachPrompt() {
 }
 
 async function testCoachConnection() {
-  const apiKey = appData.settings.coachApiKey;
-  const model  = appData.settings.geminiModel || 'gemini-2.5-flash';
+  const keyInfo = getAvailableApiKey();
+  const apiKey  = keyInfo ? keyInfo.key : (appData.settings.coachApiKey || '');
+  const model   = appData.settings.geminiModel || 'gemini-2.5-flash';
   const status = document.getElementById('connection-status');
   if (!apiKey) {
     if (status) { status.textContent = '❌ No key'; status.style.color = '#FF6B6B'; }
@@ -3404,13 +3428,135 @@ async function testCoachConnection() {
    Used by talkToCoach AND all auto-reports
    Supports Google Search grounding (web search)
 ───────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════
+   SMART API KEY ROTATION SYSTEM
+   Free tier: 20 RPD / 5 RPM per key
+   Automatically switches to next available key when one hits limits.
+   Supports up to 3 Gemini API keys.
+═══════════════════════════════════════════════════════════════ */
+
+const API_KEY_RPD_SAFE = 18; // fire at 18/20 — 2 buffer
+const API_KEY_RPM_SAFE = 4;  // fire at 4/5  — 1 buffer
+
+function hasAnyApiKey() {
+  const s = appData.settings;
+  return !!(s.coachApiKey || s.coachApiKey2 || s.coachApiKey3);
+}
+
+function getAvailableApiKey() {
+  const s = appData.settings;
+  const candidates = [
+    { key: s.coachApiKey,  id: 'key_0', label: 'Key 1' },
+    { key: s.coachApiKey2, id: 'key_1', label: 'Key 2' },
+    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' }
+  ].filter(k => k.key && k.key.trim());
+
+  if (!candidates.length) return null;
+
+  if (!s.apiKeyStats) s.apiKeyStats = {};
+
+  const todayStr  = getTodayStr();
+  const now       = new Date();
+  const minuteStr = todayStr + 'T' +
+    String(now.getHours()).padStart(2,'0') + ':' +
+    String(now.getMinutes()).padStart(2,'0');
+
+  for (const k of candidates) {
+    const stats    = s.apiKeyStats[k.id] || {};
+    const rpdUsed  = (stats.rpd && stats.rpd.date   === todayStr)  ? stats.rpd.count  : 0;
+    const rpmUsed  = (stats.rpm && stats.rpm.minute === minuteStr) ? stats.rpm.count  : 0;
+
+    if (rpdUsed >= API_KEY_RPD_SAFE) continue; // day limit hit — try next
+    if (rpmUsed >= API_KEY_RPM_SAFE) continue; // minute limit hit — try next
+
+    return { key: k.key, keyId: k.id, label: k.label, rpdUsed, rpmUsed };
+  }
+
+  return null; // all keys exhausted
+}
+
+function trackApiKeyUsage(keyId) {
+  const s = appData.settings;
+  if (!s.apiKeyStats)         s.apiKeyStats         = {};
+  if (!s.apiKeyStats[keyId])  s.apiKeyStats[keyId]  = {};
+
+  const now       = new Date();
+  const todayStr  = getTodayStr();
+  const minuteStr = todayStr + 'T' +
+    String(now.getHours()).padStart(2,'0') + ':' +
+    String(now.getMinutes()).padStart(2,'0');
+  const stats = s.apiKeyStats[keyId];
+
+  // RPD counter
+  if (!stats.rpd || stats.rpd.date !== todayStr)
+    stats.rpd = { date: todayStr, count: 0 };
+  stats.rpd.count++;
+
+  // RPM counter
+  if (!stats.rpm || stats.rpm.minute !== minuteStr)
+    stats.rpm = { minute: minuteStr, count: 0 };
+  stats.rpm.count++;
+
+  saveData();
+  refreshApiKeyStats();
+}
+
+function markKeyRateLimited(keyId) {
+  // Called on HTTP 429 — instantly max-out RPM counter so next call skips this key
+  const s        = appData.settings;
+  const now      = new Date();
+  const todayStr = getTodayStr();
+  const min      = todayStr + 'T' +
+    String(now.getHours()).padStart(2,'0') + ':' +
+    String(now.getMinutes()).padStart(2,'0');
+  if (!s.apiKeyStats)        s.apiKeyStats        = {};
+  if (!s.apiKeyStats[keyId]) s.apiKeyStats[keyId] = {};
+  s.apiKeyStats[keyId].rpm = { minute: min, count: 99 };
+  saveData();
+}
+
+function refreshApiKeyStats() {
+  const el = document.getElementById('api-key-stats-display');
+  if (!el) return;
+
+  const s = appData.settings;
+  const todayStr = getTodayStr();
+  const keys = [
+    { key: s.coachApiKey,  id: 'key_0', label: 'Key 1' },
+    { key: s.coachApiKey2, id: 'key_1', label: 'Key 2' },
+    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' }
+  ];
+
+  const rows = keys.map(k => {
+    if (!k.key || !k.key.trim()) return '';
+    const stats   = (s.apiKeyStats || {})[k.id] || {};
+    const rpdUsed = (stats.rpd && stats.rpd.date === todayStr) ? stats.rpd.count : 0;
+    const masked  = k.key.substring(0, 8) + '…';
+    const pct     = Math.round((rpdUsed / 20) * 100);
+    const color   = rpdUsed >= 18 ? '#FF6B6B' : rpdUsed >= 12 ? '#FFA07A' : '#00B894';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:12px;">
+      <span style="color:var(--text-secondary)">${k.label} <span style="opacity:.6">(${masked})</span></span>
+      <span style="color:${color};font-weight:600">${rpdUsed}/20 RPD</span>
+    </div>`;
+  }).filter(Boolean).join('');
+
+  el.innerHTML = rows || '<span style="color:var(--text-secondary);font-size:12px;">No keys configured</span>';
+}
+
 async function callGeminiAPI(systemPrompt, userContent, maxTokens) {
-  const apiKey = appData.settings.coachApiKey;
-  if (!apiKey) throw new Error('API key missing');
+  const keyInfo = getAvailableApiKey();
+  if (!keyInfo) {
+    throw new Error('Sab API keys ka daily/per-minute limit hit ho gaya. Thodi der baad try karo ya nayi key add karo.');
+  }
+
+  const { key, keyId } = keyInfo;
+
+  // Track BEFORE fetch — prevents concurrent calls from double-spending same quota slot
+  trackApiKeyUsage(keyId);
 
   const model         = appData.settings.geminiModel || 'gemini-2.5-flash';
   const searchEnabled = appData.settings.geminiSearchEnabled !== false;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
 
   const body = {
     systemInstruction: { parts: [{ text: systemPrompt }] },
@@ -3434,11 +3580,13 @@ async function callGeminiAPI(systemPrompt, userContent, maxTokens) {
 
   if (!response.ok) {
     const errData = await response.json().catch(() => ({}));
-    throw new Error(errData.error?.message || `HTTP ${response.status}`);
+    const errMsg  = errData.error?.message || `HTTP ${response.status}`;
+    // 429 = rate limit — instantly mark this key's RPM as exhausted
+    if (response.status === 429) markKeyRateLimited(keyId);
+    throw new Error(errMsg);
   }
 
-  const data = await response.json();
-  // Extract text from Gemini response format
+  const data  = await response.json();
   const parts = data.candidates?.[0]?.content?.parts || [];
   return parts.map(p => p.text || '').join('') || 'Ego ne kuch nahi kaha — try again.';
 }
@@ -3552,7 +3700,7 @@ async function sendCustomReport() {
    checkAutoCoachTriggers — called inside checkNotifications()
 ───────────────────────────────────────────── */
 function checkAutoCoachTriggers(hhmm) {
-  if (!appData.settings.coachApiKey) return;
+  if (!hasAnyApiKey()) return;
 
   // Standard auto-check times
   if (appData.settings.autoCoachEnabled) {
@@ -3902,7 +4050,7 @@ function fireAiNotification(title, fullResponse, tag, convType) {
    but the app was closed at that time, fire it now.
 ───────────────────────────────────────────── */
 function checkMissedReports() {
-  if (!appData.settings.coachApiKey) return;
+  if (!hasAnyApiKey()) return;
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
 
   const now    = new Date();
@@ -3939,7 +4087,7 @@ function checkMissedReports() {
 function checkWeeklyReportTrigger(hhmm) {
   const s = appData.settings;
   if (!s.weeklyReportEnabled) return;
-  if (!s.coachApiKey)         return;
+  if (!hasAnyApiKey())         return;
   if (s.weeklyReportTime !== hhmm) return;
 
   // Use ISO week number as key to fire once per week
@@ -4039,7 +4187,7 @@ PART 2 (full weekly report): 5-8 sentences. Har din ka trend dekho. Strong days 
 function checkDailyProgressTrigger(hhmm) {
   const s = appData.settings;
   if (!s.dailyProgressEnabled) return;
-  if (!s.coachApiKey)          return;
+  if (!hasAnyApiKey())          return;
   if (s.dailyProgressTime !== hhmm) return;
 
   const today   = getTodayStr();
@@ -4126,8 +4274,7 @@ PART 2 (full progress story): 5-7 sentences. Journey ki story bolo — kab shuru
    User asks: daily score / weekly score / overall score
 ───────────────────────────────────────────── */
 async function askScoreQuery(type) {
-  const apiKey = appData.settings.coachApiKey;
-  if (!apiKey) {
+  if (!hasAnyApiKey()) {
     showToast('⚠️ API key missing! Settings mein set karo.');
     showScreen('settings');
     scrollToCoachConfig();
