@@ -2542,23 +2542,22 @@ INSTRUCTIONS:
   if (appData.joshConversations.length > 30) appData.joshConversations = appData.joshConversations.slice(0, 30);
   saveData();
 
-  // ── Decide how to deliver the response based on app state ──
+  // ── Deliver: ALWAYS fire native notification (app open, background, or killed) ──
+  const capFiredJosh = await fireCapacitorNativeNotif(
+    '💪 ' + headline,
+    notifBody,
+    'aainik-josh',
+    'josh_auto'
+  );
+  if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
+
+  // If app is open/foreground → also refresh UI
   if (_appInForeground) {
-    // App is OPEN → show directly in UI, no notification
     if (currentScreen === 'coach') {
       switchCoachTab('josh');
       renderJoshMessages();
     }
     showToast(`💪 Josh: ${headline.substring(0, 60)}`);
-  } else {
-    // App is in BACKGROUND → fire native notification with real Gemini response
-    const capFiredJosh = await fireCapacitorNativeNotif(
-      '💪 ' + headline,
-      notifBody,
-      'aainik-josh',
-      'josh_auto'
-    );
-    if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
   }
 }
 
@@ -3849,23 +3848,24 @@ Full detailed reality check response (task-by-task analysis, working window, eff
   if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
   saveData();
 
-  // ── Decide how to deliver the response based on app state ──
+  // ── Deliver: ALWAYS fire native notification (app open, background, or killed) ──
+  // App2 behaviour: notification fires regardless of app state.
+  // If app is also open → additionally update UI + show toast.
+  const capFiredEgo = await fireCapacitorNativeNotif(
+    '🧠 ' + headline,
+    notifBody,
+    'aainik-ego',
+    'auto'
+  );
+  if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
+
+  // If app is open/foreground → also refresh UI
   if (_appInForeground) {
-    // App is OPEN → show directly in UI, no notification
     if (currentScreen === 'coach') {
       switchCoachTab('ego');
       renderCoachScreen();
     }
     showToast(`🧠 Ego: ${headline.substring(0, 60)}`);
-  } else {
-    // App is in BACKGROUND → fire native notification with real Gemini response
-    const capFiredEgo = await fireCapacitorNativeNotif(
-      '🧠 ' + headline,
-      notifBody,
-      'aainik-ego',
-      'auto'
-    );
-    if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
   }
 }
 
