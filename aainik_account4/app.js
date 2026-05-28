@@ -17,9 +17,33 @@
 /* ─────────────────────────────────────────────
    CONSTANTS
 ───────────────────────────────────────────── */
-const APP_VERSION   = '1.4.0';
+const APP_VERSION   = '1.5.0';
 const STORAGE_KEY   = 'taskMastery_v1';
-const DATA_VERSION  = 3;
+const DATA_VERSION  = 4;
+
+/* ─────────────────────────────────────────────
+   IST TIMEZONE HELPERS
+   All time comparisons use IST (UTC+5:30) to avoid
+   UTC offset bugs on devices set to non-IST timezone
+───────────────────────────────────────────── */
+function getNowISTDate() {
+  const now = new Date();
+  const istOffset = 5.5 * 60; // 5h30m in minutes
+  const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+  return new Date(utc + (istOffset * 60000));
+}
+
+function getNowISTHHMM() {
+  const d = getNowISTDate();
+  return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+}
+
+/* ─────────────────────────────────────────────
+   API ROUND-ROBIN COUNTER
+   Advances on every successful API key selection
+   so calls distribute evenly across all keys
+───────────────────────────────────────────── */
+let _apiRoundRobinIdx = 0;
 
 const PRESET_COLORS = [
   '#FF6B6B', '#4ECDC4', '#A29BFE', '#FDCB6E',
@@ -202,6 +226,8 @@ function getDefaultData() {
       coachApiKey: '',
       coachApiKey2: '',           // 2nd Gemini API key (auto-switched when key1 hits limit)
       coachApiKey3: '',           // 3rd Gemini API key (auto-switched when key2 hits limit)
+      coachApiKey4: '',           // 4th Gemini API key (round-robin rotation)
+      coachApiKey5: '',           // 5th Gemini API key (round-robin rotation)
       apiKeyStats: {},            // per-key RPD/RPM usage tracker for smart switching
       coachProvider: 'gemini',
       geminiModel: 'gemini-2.5-flash',      // 'gemini-2.5-flash' | 'gemini-2.0-flash'
@@ -215,7 +241,7 @@ function getDefaultData() {
 
       // Ego AI Mode: Auto-Coach Notifications (editable count)
       autoCoachEnabled: false,
-      autoCoachMaxPerDay: 3,         // User can edit: max auto-checks per day (1–10)
+      autoCoachMaxPerDay: 3,         // User can edit: max auto-checks per day (1–15)
       autoCoachTimes: [
         { id: 'ac_1', time: '12:00', enabled: true },
         { id: 'ac_2', time: '16:00', enabled: true },
@@ -224,15 +250,25 @@ function getDefaultData() {
       autoCoachPersonality: 'beast',
       lastAutoCoachFired: {},   // { 'YYYY-MM-DD_HH:MM': true }
 
-      // Weekly Overall Report (every 7th day)
-      weeklyReportEnabled: false,
-      weeklyReportTime: '20:00',
-      lastWeeklyReportFired: {},  // { 'YYYY-WW': true }
+      // ── Ego: Last 7 Days Report (fires daily at set time) ──
+      last7DaysReportEnabled: false,
+      last7DaysReportTime: '20:00',
+      lastLast7DaysReportFired: {},  // { 'YYYY-MM-DD': true }
 
-      // Daily Progress Report (from Day 1 to now, at editable time)
-      dailyProgressEnabled: false,
-      dailyProgressTime: '21:30',
-      lastDailyProgressFired: {},  // { 'YYYY-MM-DD': true }
+      // ── Ego: Overall Progress Report (Day 1 to now, fires daily) ──
+      overallProgressEnabled: false,
+      overallProgressTime: '21:30',
+      lastOverallProgressFired: {},  // { 'YYYY-MM-DD': true }
+
+      // ── Josh: Last 7 Days Report ──
+      joshLast7DaysEnabled: false,
+      joshLast7DaysTime: '20:30',
+      lastJoshLast7DaysFired: {},   // { 'YYYY-MM-DD': true }
+
+      // ── Josh: Overall Progress Report ──
+      joshOverallProgressEnabled: false,
+      joshOverallProgressTime: '22:00',
+      lastJoshOverallProgressFired: {},  // { 'YYYY-MM-DD': true }
 
       // ── MY-JOSH Settings ──
       joshPersonality: 'energetic',     // 'energetic' | 'calm' | 'beast'
@@ -243,12 +279,17 @@ function getDefaultData() {
         { id: 'jt_2', time: '12:00', enabled: true }
       ],
       joshPrompt: '',                   // Editable auto prompt (empty = use default by personality)
-      lastJoshAutoFired: {}             // { 'YYYY-MM-DD_HH:MM': true }
+      lastJoshAutoFired: {},            // { 'YYYY-MM-DD_HH:MM': true }
+      // Telegram delivery settings
+      telegramBotToken: '',
+      telegramChatId: ''
     },
 
     // Account 4 adds:
     conversations: [],
     joshConversations: [],      // Tera-Josh chat history (separate from Tera-Ego)
+    egoInbox:  [],   // [{id, triggerTime, date, timestamp, response, status}]
+    joshInbox: [],   // same structure
     badges: [],
     level: 1,
     totalTasksCompleted: 0,
@@ -282,14 +323,23 @@ let _appWasKilled    = false;
 let _pendingAutoQueue = [];   // [{ type: 'ego'|'josh', time: 'HH:MM' }, ...]
 let _queueProcessing  = false;
 
+// ── Guard: blocks saveData from cancelling ALL pending notifications
+// during an active API response pipeline. Set true before API call, false after.
+// Without this, the pipeline's saveData() call cancels nearby-scheduled notifications.
+let _suppressNotifReschedule = false;
+
 function saveData() {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(appData));
     // Account 2: sync notification data to service worker for background delivery
     syncNotificationDataToSW();
     // Account 5: reschedule Capacitor native notifications when data changes
+    // SKIP if a notification response pipeline is actively running — rescheduling
+    // cancels ALL pending notifications which kills any nearby-scheduled ones.
     if (typeof window.Capacitor !== 'undefined' && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
-      setTimeout(scheduleAllCapacitorNotifications, 600);
+      if (!_suppressNotifReschedule) {
+        setTimeout(scheduleAllCapacitorNotifications, 600);
+      }
     }
   } catch (e) {
     console.error('Save failed:', e);
@@ -401,6 +451,8 @@ function migrateData(old) {
   if (merged.settings.geminiSearchEnabled === undefined) merged.settings.geminiSearchEnabled = true;
   if (merged.settings.coachApiKey2 === undefined) merged.settings.coachApiKey2 = '';
   if (merged.settings.coachApiKey3 === undefined) merged.settings.coachApiKey3 = '';
+  if (merged.settings.coachApiKey4 === undefined) merged.settings.coachApiKey4 = '';
+  if (merged.settings.coachApiKey5 === undefined) merged.settings.coachApiKey5 = '';
   if (!merged.settings.apiKeyStats)              merged.settings.apiKeyStats   = {};
 
   // Ego AI Mode: ensure auto-coach fields exist in settings
@@ -416,19 +468,40 @@ function migrateData(old) {
   if (!merged.settings.autoCoachPersonality)  merged.settings.autoCoachPersonality  = 'beast';
   if (!merged.settings.lastAutoCoachFired)     merged.settings.lastAutoCoachFired    = {};
 
-  // Weekly report migration
-  if (merged.settings.weeklyReportEnabled  === undefined) merged.settings.weeklyReportEnabled  = false;
-  if (!merged.settings.weeklyReportTime)                  merged.settings.weeklyReportTime     = '20:00';
-  if (!merged.settings.lastWeeklyReportFired)             merged.settings.lastWeeklyReportFired = {};
+  // Migrate old weekly/daily report fields → new last7days/overall fields
+  if (merged.settings.last7DaysReportEnabled === undefined)
+    merged.settings.last7DaysReportEnabled = merged.settings.weeklyReportEnabled || false;
+  if (!merged.settings.last7DaysReportTime)
+    merged.settings.last7DaysReportTime = merged.settings.weeklyReportTime || '20:00';
+  if (!merged.settings.lastLast7DaysReportFired)
+    merged.settings.lastLast7DaysReportFired = {};
 
-  // Daily progress report migration
-  if (merged.settings.dailyProgressEnabled  === undefined) merged.settings.dailyProgressEnabled  = false;
-  if (!merged.settings.dailyProgressTime)                  merged.settings.dailyProgressTime     = '21:30';
-  if (!merged.settings.lastDailyProgressFired)             merged.settings.lastDailyProgressFired = {};
+  if (merged.settings.overallProgressEnabled === undefined)
+    merged.settings.overallProgressEnabled = merged.settings.dailyProgressEnabled || false;
+  if (!merged.settings.overallProgressTime)
+    merged.settings.overallProgressTime = merged.settings.dailyProgressTime || '21:30';
+  if (!merged.settings.lastOverallProgressFired)
+    merged.settings.lastOverallProgressFired = merged.settings.lastDailyProgressFired || {};
+
+  // Josh last7days + overall progress migration
+  if (merged.settings.joshLast7DaysEnabled === undefined) merged.settings.joshLast7DaysEnabled = false;
+  if (!merged.settings.joshLast7DaysTime) merged.settings.joshLast7DaysTime = '20:30';
+  if (!merged.settings.lastJoshLast7DaysFired) merged.settings.lastJoshLast7DaysFired = {};
+  if (merged.settings.joshOverallProgressEnabled === undefined) merged.settings.joshOverallProgressEnabled = false;
+  if (!merged.settings.joshOverallProgressTime) merged.settings.joshOverallProgressTime = '22:00';
+  if (!merged.settings.lastJoshOverallProgressFired) merged.settings.lastJoshOverallProgressFired = {};
 
   // Ego Mode: new fields
   if (merged.settings.egoLifeGoals    === undefined) merged.settings.egoLifeGoals    = '';
   if (merged.settings.egoNegativeWords === undefined) merged.settings.egoNegativeWords = '';
+
+  // New: Telegram settings
+  if (!merged.settings.telegramBotToken) merged.settings.telegramBotToken = '';
+  if (!merged.settings.telegramChatId)   merged.settings.telegramChatId   = '';
+
+  // New: Inbox arrays
+  if (!merged.egoInbox)  merged.egoInbox  = [];
+  if (!merged.joshInbox) merged.joshInbox = [];
 
   merged.version = DATA_VERSION;
   return merged;
@@ -439,7 +512,7 @@ function migrateData(old) {
 ───────────────────────────────────────────── */
 let currentScreen = 'today';
 
-const _SCREEN_ORDER = ['today','categories','progress','coach','settings'];
+const _SCREEN_ORDER = ['today','categories','progress','coach','inbox','settings'];
 
 function showScreen(name) {
   const prevIdx = _SCREEN_ORDER.indexOf(currentScreen || 'today');
@@ -468,20 +541,22 @@ function showScreen(name) {
   if (name === 'progress')   renderProgressScreen();
   if (name === 'settings')   renderSettingsScreen();
   if (name === 'coach')      renderCoachScreen();
+  if (name === 'inbox')      renderInboxScreen();
 }
 
 /* ─────────────────────────────────────────────
    DATE HELPERS
 ───────────────────────────────────────────── */
 function getTodayStr() {
-  const now = new Date();
-  return now.getFullYear() + '-' +
-         String(now.getMonth() + 1).padStart(2, '0') + '-' +
-         String(now.getDate()).padStart(2, '0');
+  // Force Indian Standard Time (UTC+5:30) regardless of device timezone
+  const d = getNowISTDate();
+  return d.getFullYear() + '-' +
+         String(d.getMonth() + 1).padStart(2, '0') + '-' +
+         String(d.getDate()).padStart(2, '0');
 }
 
 function getYesterdayStr() {
-  const d = new Date();
+  const d = getNowISTDate();
   d.setDate(d.getDate() - 1);
   return d.getFullYear() + '-' +
          String(d.getMonth() + 1).padStart(2, '0') + '-' +
@@ -928,8 +1003,7 @@ function adjustEffort(taskId, date, delta) {
 ───────────────────────────────────────────── */
 function checkWorkingWindowExpiry() {
   const today = getTodayStr();
-  const now = new Date();
-  const hhmm = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
+  const hhmm  = getNowISTHHMM(); // IST time
 
   let changed = false;
 
@@ -1079,10 +1153,10 @@ function switchReportTab(tab) {
     btn.classList.toggle('active', btn.dataset.tab === tab);
   });
 
-  // Show/hide content panels
-  ['daily','weekly','overall'].forEach(t => {
+  // Show/hide content panels — support both 'last7days' and legacy 'weekly' id
+  ['daily','last7days','weekly','overall'].forEach(t => {
     const el = document.getElementById('tab-' + t);
-    if (el) el.classList.toggle('hidden', t !== tab);
+    if (el) el.classList.toggle('hidden', t !== tab && !(tab === 'last7days' && t === 'weekly'));
   });
 
   // Show/hide date nav (only for daily)
@@ -1093,9 +1167,9 @@ function switchReportTab(tab) {
 }
 
 function renderReportTab(tab) {
-  if (tab === 'daily')   renderDailyReport();
-  if (tab === 'weekly')  renderWeeklyReport();
-  if (tab === 'overall') renderOverallReport();
+  if (tab === 'daily')    renderDailyReport();
+  if (tab === 'last7days' || tab === 'weekly') renderWeeklyReport();
+  if (tab === 'overall')  renderOverallReport();
 }
 
 /* ─────────────────────────────────────────────
@@ -2119,10 +2193,10 @@ function buildReportText() {
       });
       text += '\n';
     });
-  } else if (tab === 'weekly') {
+  } else if (tab === 'last7days' || tab === 'weekly') {
     const weekly = getWeeklyAvg();
-    text += `WEEKLY REPORT (Last 7 Days)\n`;
-    text += `Weekly Average: ${weekly}%\n\n`;
+    text += `LAST 7 DAYS REPORT\n`;
+    text += `Last 7 Days Average: ${weekly}%\n\n`;
     const days = [];
     for (let i = 6; i >= 0; i--) days.push(dateNDaysAgo(i));
     days.forEach(d => {
@@ -2436,13 +2510,18 @@ ENDING: 4–5 battle-cry motivational lines. ALL CAPS acceptable for effect.`;
    MY-JOSH FUNCTIONS
 ───────────────────────────────────────────── */
 
-function getJoshActivePrompt() {
+function getJoshActiveFullPrompt(personality) {
   const s = appData.settings;
-  const personality = s.joshPersonality || 'energetic';
   if (s.joshPrompt && s.joshPrompt.trim()) return s.joshPrompt;
   if (personality === 'calm')  return JOSH_CALM_PROMPT;
   if (personality === 'beast') return JOSH_BEAST_PROMPT;
   return JOSH_ENERGETIC_PROMPT;
+}
+
+// Convenience alias — uses current saved personality setting
+function getJoshActivePrompt() {
+  const personality = appData.settings.joshPersonality || 'energetic';
+  return getJoshActiveFullPrompt(personality);
 }
 
 function buildJoshContextForReminder(triggerTime) {
@@ -2460,7 +2539,16 @@ function buildJoshContextForReminder(triggerTime) {
     })
     .map(t => {
       const cat = appData.categories.find(c => c.id === t.categoryId);
-      const done = appData.history.find(h => h.taskId === t.id && h.date === today && h.completed);
+      // Only count a task as "done" if marked done at or before triggerTime on that date
+      const entryAtTrigger = appData.history.find(h => {
+        if (h.taskId !== t.id || h.date !== today) return false;
+        if (!h.timestamp) return true; // legacy entry
+        const istOffset = 5.5 * 60;
+        const istDate = new Date(h.timestamp + (new Date().getTimezoneOffset() * 60000) + (istOffset * 60000));
+        const entryHHMM = String(istDate.getHours()).padStart(2,'0') + ':' + String(istDate.getMinutes()).padStart(2,'0');
+        return entryHHMM <= triggerTime;
+      });
+      const done = entryAtTrigger && entryAtTrigger.completed;
       return {
         name: t.name,
         category: cat ? cat.name : '',
@@ -2496,12 +2584,37 @@ async function runJoshAutoReminder(triggerTime) {
     `• [${t.category}] "${t.name}" | Priority: ${t.priority} | Window: ${t.workingWindow}\n  Why it matters (user ka likha hua): "${t.whyMatters}"`
   ).join('\n') || 'None pending in this slot';
 
-  const userContent = `TERA-JOSH REMINDER — Time: ${triggerTime}
+  // Bug Fix 5: Time-aware score for Josh — only count expired windows
+  const _joshISTNow = getNowISTHHMM();
+  const _joshToday = getTodayStr();
+  const _joshExpiredTasks = appData.tasks.filter(t => {
+    if (t.active === false) return false;
+    const winEnd = t.workingWindowEnd || '';
+    return winEnd && winEnd < _joshISTNow;
+  });
+  const _joshDayNotStarted = _joshExpiredTasks.length === 0;
+  const _joshExpiredDone = _joshExpiredTasks.filter(t => {
+    const e = appData.history.find(h => h.taskId === t.id && h.date === _joshToday);
+    return e && e.completed;
+  }).length;
+  const _joshEffectiveScore = _joshDayNotStarted ? null
+    : Math.round((_joshExpiredDone / _joshExpiredTasks.length) * 100);
+
+  const userContent = `TERA-JOSH REMINDER — Time: ${triggerTime} IST
+🕐 CURRENT IST TIME: ${_joshISTNow} IST (UTC+5:30) — Always use IST for time comparisons, never UTC.
 
 UPCOMING PENDING TASKS (${triggerTime} se agle slot mein):
 ${taskLines}
 
-TODAY'S SCORE SO FAR: ${context.daily.score}% (${context.daily.done}/${context.daily.taskCount} tasks done)
+TODAY'S SCORE SO FAR: ${_joshDayNotStarted
+  ? `0% — BUT din abhi shuru hua hai, koi working window abhi expire nahi hui. 0% is NOT a failure. DO NOT judge for zero score. Focus only on motivating for upcoming tasks.`
+  : `${_joshEffectiveScore}% on expired windows (${_joshExpiredDone}/${_joshExpiredTasks.length} tasks done) — ${context.daily.done}/${context.daily.taskCount} total marked done`}
+
+⚠️ JUDGING RULES FOR JOSH:
+- Upcoming tasks listed above: motivate strongly, don't condemn, window still open
+- Tasks already ✅ done: celebrate!
+- If score is 0% but day just started (no expired windows): be encouraging, NOT harsh
+- Only judge tasks where window has already closed and not done
 
 LIFE GOALS (user ne khud likhe hain — positively connect karo):
 ${context.lifeGoals || 'Not set'}
@@ -2542,46 +2655,30 @@ INSTRUCTIONS:
   if (appData.joshConversations.length > 30) appData.joshConversations = appData.joshConversations.slice(0, 30);
   saveData();
 
-  // ── Deliver: ALWAYS fire native notification (app open, background, or killed) ──
-  const capFiredJosh = await fireCapacitorNativeNotif(
-    '💪 ' + headline,
-    notifBody,
-    'aainik-josh',
-    'josh_auto'
-  );
-  if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
-
-  // If app is open/foreground → also refresh UI
+  // ── Decide how to deliver the response based on app state ──
   if (_appInForeground) {
+    // App is OPEN → show directly in UI, no notification
     if (currentScreen === 'coach') {
       switchCoachTab('josh');
       renderJoshMessages();
     }
-    showToast(`💪 Josh: ${headline.substring(0, 60)}`);
+    if (currentScreen === 'inbox') renderInboxScreen();
+    showToast(`💪 Josh: ${headline.substring(0, 60)}`, true);
+  } else {
+    // App is in BACKGROUND → fire native notification with real Gemini response
+    const capFiredJosh = await fireCapacitorNativeNotif(
+      '💪 ' + headline,
+      notifBody,
+      'aainik-josh',
+      'josh_auto'
+    );
+    if (!capFiredJosh) fireAiNotification(headline, notifBody, 'josh-auto-' + triggerTime, 'josh_auto');
   }
 }
 
 function checkJoshAutoTriggers(hhmm) {
-  const s = appData.settings;
-  if (!s.joshAutoEnabled) return;
-  if (!hasAnyApiKey()) return; // need at least one API key
-
-  const times = s.joshAutoTimes || [];
-  times.forEach(entry => {
-    if (!entry.enabled) return;
-    if (entry.time !== hhmm) return;
-
-    const fireKey = getTodayStr() + '_' + entry.time;
-    if (s.lastJoshAutoFired && s.lastJoshAutoFired[fireKey]) return;
-
-    if (!s.lastJoshAutoFired) s.lastJoshAutoFired = {};
-    s.lastJoshAutoFired[fireKey] = true;
-    saveData();
-
-    runJoshAutoReminder(entry.time).catch(err => {
-      console.warn('Josh auto reminder failed:', err.message);
-    });
-  });
+  // AUTO API CALLS REMOVED — notifications are pre-scheduled via scheduleAllCapacitorNotifications()
+  // No-op: kept for reference only
 }
 
 async function joshManualChat(userMessage, daysCount) {
@@ -2618,7 +2715,22 @@ Past performance data use karo context ke liye.
 Josh should be warm, insightful, motivating.
 User ke message ka seedha jawab pehle, phir motivation.`;
 
-  const userContent = `USER MESSAGE: ${userMessage.trim()}
+  const istNow = getNowISTDate();
+  const currentISTTime = istNow.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata', hour12: true,
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  });
+
+  const lastJoshResp = getLastJoshResponse();
+  const lastJoshNote = lastJoshResp
+    ? `\n\nMERI LAST RESPONSE (jo maine pichli baar kahi thi):\n"${lastJoshResp.substring(0, 500)}"\n\nIs context ko use karo — kya user ne progress ki?`
+    : '';
+
+  try {
+    const fullUserContent = `USER MESSAGE: ${userMessage.trim()}
+
+CURRENT TIME (IST): ${currentISTTime}
 
 CONTEXT (Last ${daysCount} days performance):
 ${dailyData.map(d => `${d.date}: ${d.score}% (${d.done}/${d.total} tasks)`).join('\n')}
@@ -2630,10 +2742,9 @@ Task "Why It Matters":
 ${appData.tasks.filter(t => t.active !== false && t.whyMatters).map(t => {
   const cat = appData.categories.find(c => c.id === t.categoryId);
   return `• [${cat ? cat.name : ''}] ${t.name}: "${t.whyMatters}"`;
-}).join('\n') || 'None set'}`;
+}).join('\n') || 'None set'}${lastJoshNote}`;
 
-  try {
-    const response = await callGeminiAPI(systemPrompt, userContent, 800);
+    const response = await callGeminiAPI(systemPrompt, fullUserContent, 800);
 
     if (!appData.joshConversations) appData.joshConversations = [];
     appData.joshConversations.push({
@@ -2738,8 +2849,12 @@ function renderJoshSettings() {
   const maxInp = document.getElementById('josh-auto-max-per-day');
   if (maxInp) maxInp.value = s.joshAutoMaxPerDay || 3;
 
+  // Change 6: Show active prompt (custom or default) — same as Ego does
   const promptTA = document.getElementById('josh-prompt-textarea');
-  if (promptTA) promptTA.value = s.joshPrompt || '';
+  if (promptTA) {
+    const personality = s.joshPersonality || 'energetic';
+    promptTA.value = getJoshActiveFullPrompt(personality);
+  }
 
   renderJoshAutoTimeList();
 }
@@ -2806,7 +2921,7 @@ function updateJoshAutoTime(id, time) {
 
 function updateJoshMaxPerDay(val) {
   const n = parseInt(val);
-  if (isNaN(n) || n < 1 || n > 10) return;
+  if (isNaN(n) || n < 1 || n > 15) return;
   appData.settings.joshAutoMaxPerDay = n;
   saveData();
   renderJoshAutoTimeList();
@@ -2832,7 +2947,7 @@ function resetJoshPrompt() {
   delete appData.settings._joshPromptDraft;
   saveData();
   const ta = document.getElementById('josh-prompt-textarea');
-  if (ta) ta.value = '';
+  if (ta) ta.value = getJoshActiveFullPrompt(appData.settings.joshPersonality || 'energetic');
   showToast('↺ Tera-Josh prompt default pe reset hua');
 }
 
@@ -2877,6 +2992,29 @@ function clearActiveCoachConversations() {
   }
 }
 
+/* ─────────────────────────────────────────────
+   INBOX SCREEN — Separate from Coach screen
+   Ego inbox + Josh inbox as tabs
+───────────────────────────────────────────── */
+let currentInboxTab = 'ego';
+
+function renderInboxScreen() {
+  renderEgoInbox();
+  renderJoshInbox();
+  switchInboxTab(currentInboxTab);
+}
+
+function switchInboxTab(tab) {
+  currentInboxTab = tab;
+  const egoPanel  = document.getElementById('inbox-panel-ego');
+  const joshPanel = document.getElementById('inbox-panel-josh');
+  if (egoPanel)  egoPanel.classList.toggle('hidden', tab !== 'ego');
+  if (joshPanel) joshPanel.classList.toggle('hidden', tab !== 'josh');
+  const egoBtn  = document.getElementById('inbox-tab-ego-btn');
+  const joshBtn = document.getElementById('inbox-tab-josh-btn');
+  if (egoBtn)  egoBtn.classList.toggle('active', tab === 'ego');
+  if (joshBtn) joshBtn.classList.toggle('active', tab === 'josh');
+}
 
 /* ─────────────────────────────────────────────
    COACH SCREEN RENDER
@@ -3079,7 +3217,13 @@ async function talkToCoach() {
       else                 maxTok = 500;
     }
 
-    const replyText = await callGeminiAPI(systemPrompt, userContent, maxTok);
+    const replyText = await callGeminiAPI(systemPrompt, (() => {
+      const lastResp = getLastEgoResponse();
+      const lastNote = lastResp
+        ? `\n\nMERI LAST RESPONSE (jo maine pichli baar kahi thi — cross-check karo):\n"${lastResp.substring(0, 500)}"\n\nIs last response ko context ke roop mein use karo — kya user ne follow kiya? Accordingly react karo.`
+        : '';
+      return userContent + lastNote;
+    })(), maxTok);
 
     // Save conversation
     const conv = {
@@ -3128,30 +3272,60 @@ function buildSystemPrompt() {
   const personality = s.coachPersonality || 'beast';
   const base = getActiveCoachPrompt(personality);
 
-  // ── Score-based brutality calibration ──
+  // ── Bug Fix 3: IST time — always inject before anything else ──
+  const _istHHMM = getNowISTHHMM();
+  const istNow = getNowISTDate();
+  const currentISTTime = istNow.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata', hour12: true,
+    weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+    hour: '2-digit', minute: '2-digit'
+  });
+  const _istTimeNote = `\n\n🕐 CURRENT IST TIME: ${_istHHMM} IST (Indian Standard Time = UTC+5:30 — ${currentISTTime}). ALWAYS use this time for ALL time comparisons. NEVER use UTC. DO NOT use Google Search to find current time — use the IST time provided here. Kisi bhi task ke window comparison ke liye yahi time use karo.`;
+
+  // ── Bug Fix 2: Effective score — only count tasks whose window has EXPIRED ──
   const today = getTodayStr();
   const daily = getDailyScore(today);
   const score = daily.score || 0;
   const strictness = s.coachStrictness || 80;
 
+  const _expiredTasks = appData.tasks.filter(t => {
+    if (t.active === false) return false;
+    const winEnd = t.workingWindowEnd || '';
+    return winEnd && winEnd < _istHHMM; // only tasks whose window has already CLOSED
+  });
+  const _dayNotStarted = _expiredTasks.length === 0; // no window has expired yet → day hasn't truly started
+  const _expiredDone = _expiredTasks.filter(t => {
+    const e = appData.history.find(h => h.taskId === t.id && h.date === today);
+    return e && e.completed;
+  }).length;
+  const _effectiveScore = _dayNotStarted ? null : Math.round((_expiredDone / _expiredTasks.length) * 100);
+
+  // ── Bug Fix 2: Brutality based on EFFECTIVE score, not raw getDailyScore ──
   let brutalityNote = '';
   if (personality === 'beast') {
-    if (score < 40) {
-      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Score sirf ${score}% hai. YEH BAHUT KHARAB HAI. MAXIMUM BRUTALITY MODE ON. Ek ek miss pe roast kar. Long detailed reality check de. Dark humour, sarcasm, guilt — sab kuch use kar. 300-400 words. Phir bhi ending mein fire daal.`;
-    } else if (score < 60) {
-      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Score ${score}% hai — below average. HIGH BRUTALITY. Missed tasks pe seedha jaao, goals se connect karo, negative words reference karo. 200-300 words.`;
-    } else if (score < 80) {
-      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Score ${score}% hai — theek hai but not enough. MODERATE HONEST. Direct feedback, jo miss hua uska reason address karo. No roast but no softness. 150-200 words.`;
+    if (_dayNotStarted) {
+      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Abhi tak kisi bhi task ki working window expire nahi hui — din abhi shuru hi hua hai ya task windows abhi khuli nahi. Isliye 0% score koi failure NAHI hai. DO NOT roast for zero score. Tasks jo "NOT YET STARTED 🔮" hain unhe judge MAT karo. Bas upcoming tasks ke liye energy aur focus de. Agar koi task tha jiska window already close ho gaya ho aur wo done nahi hua — sirf wohi judge karo.`;
+    } else if (_effectiveScore < 40) {
+      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Expire hui windows mein se sirf ${_effectiveScore}% tasks complete — YEH BAHUT KHARAB HAI. MAXIMUM BRUTALITY MODE ON. Ek ek miss pe roast kar. 300-400 words. Phir bhi ending mein fire daal.`;
+    } else if (_effectiveScore < 60) {
+      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Expire hui windows mein ${_effectiveScore}% — below average. HIGH BRUTALITY. Missed tasks pe seedha jaao, goals se connect karo. 200-300 words.`;
+    } else if (_effectiveScore < 80) {
+      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Expire hui windows mein ${_effectiveScore}% — theek hai but not enough. MODERATE HONEST. Direct feedback. 150-200 words.`;
     } else {
-      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Score ${score}% hai — achha hai. NO BRUTALITY but NO SUGAR COAT. Short, serious, "consistency mat todo" energy. 80-120 words max.`;
+      brutalityNote = `\n\n⚠️ SCORE CALIBRATION: Expire hui windows mein ${_effectiveScore}% — achha hai. NO BRUTALITY but NO SUGAR COAT. Short, serious energy. 80-120 words max.`;
     }
-    // Strictness multiplier
-    if (strictness >= 90) brutalityNote += ' STRICTNESS MAXIMUM — ek bhi excuse mat sunna.';
-    else if (strictness <= 30) brutalityNote += ' Strictness low hai — thoda calm raho lekin honest raho.';
+    if (!_dayNotStarted) {
+      if (strictness >= 90) brutalityNote += ' STRICTNESS MAXIMUM — ek bhi excuse mat sunna.';
+      else if (strictness <= 30) brutalityNote += ' Strictness low — thoda calm raho lekin honest raho.';
+    }
   } else if (personality === 'balanced') {
-    brutalityNote = `\n\nSCORE: ${score}%. Balanced honest feedback accordingly do.`;
+    brutalityNote = _dayNotStarted
+      ? `\n\nSCORE: Din abhi shuru hua hai — koi window expire nahi hui. Upcoming tasks ke liye positive aur focused rahna.`
+      : `\n\nSCORE: Expire hui windows mein ${_effectiveScore}%. Balanced honest feedback do.`;
   } else {
-    brutalityNote = `\n\nSCORE: ${score}%. Gently honest raho accordingly.`;
+    brutalityNote = _dayNotStarted
+      ? `\n\nSCORE: Din shuru ho raha hai. Gently encourage karo upcoming tasks ke liye.`
+      : `\n\nSCORE: Expire hui windows mein ${_effectiveScore}%. Gently honest raho.`;
   }
 
   // ── EGO CONTEXT: Life Goals ──
@@ -3175,33 +3349,43 @@ function buildSystemPrompt() {
     ? '\n\n📋 HAR TASK KA "WHY" (jo tune khud likha tha — missed tasks ke liye seedha quote kar):\n' + taskWhyLines
     : '';
 
-  // ── EGO CONTEXT: Task status with effort + working window ──
+  // ── Bug Fix 1: Task status with TIME-AWARE classification ──
   const effortLines = appData.tasks
     .filter(t => t.active !== false)
     .map(t => {
       const entry = appData.history.find(h => h.taskId === t.id && h.date === today);
       const cat = appData.categories.find(c => c.id === t.categoryId);
       const catName = cat ? cat.name : '';
+      const winStart = t.workingWindowStart || '00:00';
+      const winEnd   = t.workingWindowEnd   || '23:59';
       const ww = t.workingWindowEnd
-        ? `Working window: ${t.workingWindowStart || '?'}–${t.workingWindowEnd}`
-        : (t.workingWindowStart ? `Start: ${t.workingWindowStart}` : 'No window set');
+        ? `Working window: ${winStart}–${winEnd} IST`
+        : (t.workingWindowStart ? `Start: ${winStart} IST` : 'No window set');
+
       if (entry && entry.completed) {
         const eff = entry.effortDeclared ? `Effort: ${entry.effortScore}/10` : 'Effort: not declared (full credit given)';
         return `• [${catName}] ${t.name} — ✅ DONE | ${eff} | ${ww}`;
       } else if (entry && entry.isUntracked) {
-        return `• [${catName}] ${t.name} — ⚠️ UNTRACKED (window closed, not done — WORST CASE, 0 score) | ${ww}`;
+        return `• [${catName}] ${t.name} — ⚠️ UNTRACKED (window closed without marking — 0 score) | ${ww}`;
       } else if (entry && !entry.completed) {
-        return `• [${catName}] ${t.name} — ❌ NOT DONE | ${ww}`;
+        return `• [${catName}] ${t.name} — ❌ MISSED (window already closed, marked not done) | ${ww}`;
       } else {
-        return `• [${catName}] ${t.name} — ⏳ PENDING | ${ww}`;
+        // No history entry — classify purely by IST time vs working window
+        if (_istHHMM < winStart) {
+          return `• [${catName}] ${t.name} — 🔮 NOT YET STARTED (window opens at ${winStart} IST — DO NOT judge this task as failed, it hasn't even started) | ${ww}`;
+        } else if (_istHHMM <= winEnd) {
+          return `• [${catName}] ${t.name} — ⏳ IN PROGRESS (window active ${winStart}–${winEnd} IST — abhi time hai, user may still complete or mark done before window closes) | ${ww}`;
+        } else {
+          return `• [${catName}] ${t.name} — ❌ MISSED (window ${winStart}–${winEnd} IST already closed, no entry — counts as not done) | ${ww}`;
+        }
       }
     }).join('\n');
 
   const effortNote = effortLines
-    ? '\n\n📊 TASK STATUS WITH EFFORT + WORKING WINDOW (Category name + task name se context infer kar — specific feedback de):\n' + effortLines
+    ? '\n\n📊 TASK STATUS + WORKING WINDOW (IST-based, time-aware classification):\n' + effortLines
     : '';
 
-  return base + brutalityNote + goalsNote + negNote + whyNote + effortNote;
+  return base + _istTimeNote + brutalityNote + goalsNote + negNote + whyNote + effortNote;
 }
 
 /* ─────────────────────────────────────────────
@@ -3306,6 +3490,10 @@ function renderCoachSettings() {
   if (keyInp2) keyInp2.value = s.coachApiKey2 || '';
   const keyInp3 = document.getElementById('coach-api-key-input-3');
   if (keyInp3) keyInp3.value = s.coachApiKey3 || '';
+  const keyInp4 = document.getElementById('coach-api-key-input-4');
+  if (keyInp4) keyInp4.value = s.coachApiKey4 || '';
+  const keyInp5 = document.getElementById('coach-api-key-input-5');
+  if (keyInp5) keyInp5.value = s.coachApiKey5 || '';
   refreshApiKeyStats();
 
   // Gemini model selector
@@ -3455,6 +3643,31 @@ async function testCoachConnection() {
 }
 
 /* ─────────────────────────────────────────────
+   CHANGE 8 — LAST RESPONSE HELPERS
+   Attach the last AI response to every API call
+   so the AI knows what it said before
+───────────────────────────────────────────── */
+function getLastEgoResponse() {
+  const convs = appData.conversations || [];
+  for (let i = 0; i < convs.length; i++) {
+    if (convs[i].response && convs[i].response.trim()) {
+      return convs[i].response.trim();
+    }
+  }
+  return null;
+}
+
+function getLastJoshResponse() {
+  const convs = appData.joshConversations || [];
+  for (let i = 0; i < convs.length; i++) {
+    if (convs[i].response && convs[i].response.trim()) {
+      return convs[i].response.trim();
+    }
+  }
+  return null;
+}
+
+/* ─────────────────────────────────────────────
    SHARED GEMINI API HELPER
    Used by talkToCoach AND all auto-reports
    Supports Google Search grounding (web search)
@@ -3471,35 +3684,40 @@ const API_KEY_RPM_SAFE = 4;  // fire at 4/5  — 1 buffer
 
 function hasAnyApiKey() {
   const s = appData.settings;
-  return !!(s.coachApiKey || s.coachApiKey2 || s.coachApiKey3);
+  return !!(s.coachApiKey || s.coachApiKey2 || s.coachApiKey3 || s.coachApiKey4 || s.coachApiKey5);
 }
 
 function getAvailableApiKey() {
   const s = appData.settings;
-  const candidates = [
+  const allKeys = [
     { key: s.coachApiKey,  id: 'key_0', label: 'Key 1' },
     { key: s.coachApiKey2, id: 'key_1', label: 'Key 2' },
-    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' }
+    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' },
+    { key: s.coachApiKey4, id: 'key_3', label: 'Key 4' },
+    { key: s.coachApiKey5, id: 'key_4', label: 'Key 5' }
   ].filter(k => k.key && k.key.trim());
 
-  if (!candidates.length) return null;
-
+  if (!allKeys.length) return null;
   if (!s.apiKeyStats) s.apiKeyStats = {};
 
   const todayStr  = getTodayStr();
-  const now       = new Date();
-  const minuteStr = todayStr + 'T' +
-    String(now.getHours()).padStart(2,'0') + ':' +
-    String(now.getMinutes()).padStart(2,'0');
+  const minuteStr = todayStr + 'T' + getNowISTHHMM();
 
-  for (const k of candidates) {
-    const stats    = s.apiKeyStats[k.id] || {};
-    const rpdUsed  = (stats.rpd && stats.rpd.date   === todayStr)  ? stats.rpd.count  : 0;
-    const rpmUsed  = (stats.rpm && stats.rpm.minute === minuteStr) ? stats.rpm.count  : 0;
+  // Round-robin: start from _apiRoundRobinIdx, cycle through all keys
+  const startIdx = _apiRoundRobinIdx % allKeys.length;
+
+  for (let attempt = 0; attempt < allKeys.length; attempt++) {
+    const idx  = (startIdx + attempt) % allKeys.length;
+    const k    = allKeys[idx];
+    const stats   = s.apiKeyStats[k.id] || {};
+    const rpdUsed = (stats.rpd && stats.rpd.date   === todayStr)  ? stats.rpd.count  : 0;
+    const rpmUsed = (stats.rpm && stats.rpm.minute === minuteStr) ? stats.rpm.count  : 0;
 
     if (rpdUsed >= API_KEY_RPD_SAFE) continue; // day limit hit — try next
     if (rpmUsed >= API_KEY_RPM_SAFE) continue; // minute limit hit — try next
 
+    // Advance round-robin index for next call
+    _apiRoundRobinIdx = (idx + 1) % allKeys.length;
     return { key: k.key, keyId: k.id, label: k.label, rpdUsed, rpmUsed };
   }
 
@@ -3511,11 +3729,8 @@ function trackApiKeyUsage(keyId) {
   if (!s.apiKeyStats)         s.apiKeyStats         = {};
   if (!s.apiKeyStats[keyId])  s.apiKeyStats[keyId]  = {};
 
-  const now       = new Date();
   const todayStr  = getTodayStr();
-  const minuteStr = todayStr + 'T' +
-    String(now.getHours()).padStart(2,'0') + ':' +
-    String(now.getMinutes()).padStart(2,'0');
+  const minuteStr = todayStr + 'T' + getNowISTHHMM();
   const stats = s.apiKeyStats[keyId];
 
   // RPD counter
@@ -3533,13 +3748,9 @@ function trackApiKeyUsage(keyId) {
 }
 
 function markKeyRateLimited(keyId) {
-  // Called on HTTP 429 — instantly max-out RPM counter so next call skips this key
   const s        = appData.settings;
-  const now      = new Date();
   const todayStr = getTodayStr();
-  const min      = todayStr + 'T' +
-    String(now.getHours()).padStart(2,'0') + ':' +
-    String(now.getMinutes()).padStart(2,'0');
+  const min      = todayStr + 'T' + getNowISTHHMM();
   if (!s.apiKeyStats)        s.apiKeyStats        = {};
   if (!s.apiKeyStats[keyId]) s.apiKeyStats[keyId] = {};
   s.apiKeyStats[keyId].rpm = { minute: min, count: 99 };
@@ -3555,7 +3766,9 @@ function refreshApiKeyStats() {
   const keys = [
     { key: s.coachApiKey,  id: 'key_0', label: 'Key 1' },
     { key: s.coachApiKey2, id: 'key_1', label: 'Key 2' },
-    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' }
+    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' },
+    { key: s.coachApiKey4, id: 'key_3', label: 'Key 4' },
+    { key: s.coachApiKey5, id: 'key_4', label: 'Key 5' }
   ];
 
   const rows = keys.map(k => {
@@ -3574,55 +3787,108 @@ function refreshApiKeyStats() {
   el.innerHTML = rows || '<span style="color:var(--text-secondary);font-size:12px;">No keys configured</span>';
 }
 
-async function callGeminiAPI(systemPrompt, userContent, maxTokens) {
-  const keyInfo = getAvailableApiKey();
-  if (!keyInfo) {
-    throw new Error('Sab API keys ka daily/per-minute limit hit ho gaya. Thodi der baad try karo ya nayi key add karo.');
-  }
-
-  const { key, keyId } = keyInfo;
-
-  // Track BEFORE fetch — prevents concurrent calls from double-spending same quota slot
-  trackApiKeyUsage(keyId);
-
-  const model         = appData.settings.geminiModel || 'gemini-2.5-flash';
-  const searchEnabled = appData.settings.geminiSearchEnabled !== false;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${key}`;
-
-  const body = {
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ role: 'user', parts: [{ text: userContent }] }],
-    generationConfig: {
-      temperature: 0.85,
-      thinkingConfig: { thinkingBudget: 0 }
-    }
-  };
-
-  // Enable Google Search grounding for real-time context
-  if (searchEnabled) {
-    body.tools = [{ google_search: {} }];
-  }
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
-  });
-
-  if (!response.ok) {
-    const errData = await response.json().catch(() => ({}));
-    const errMsg  = errData.error?.message || `HTTP ${response.status}`;
-    // 429 = rate limit — instantly mark this key's RPM as exhausted
-    if (response.status === 429) markKeyRateLimited(keyId);
-    throw new Error(errMsg);
-  }
-
-  const data  = await response.json();
-  const parts = data.candidates?.[0]?.content?.parts || [];
-  return parts.map(p => p.text || '').join('') || 'Ego ne kuch nahi kaha — try again.';
+function updateCoachApiKey4(val) {
+  appData.settings.coachApiKey4 = val.trim();
+  saveData();
+  refreshApiKeyStats();
 }
 
-// Legacy alias so any remaining callGroqAPI references still work
+function updateCoachApiKey5(val) {
+  appData.settings.coachApiKey5 = val.trim();
+  saveData();
+  refreshApiKeyStats();
+}
+
+async function callGeminiAPI(systemPrompt, userContent, maxTokens) {
+  // ── Silent retry: try all available keys before giving up ──
+  // This prevents a single key's rate limit / error from breaking user experience.
+  const s = appData.settings;
+  const allKeys = [
+    { key: s.coachApiKey,  id: 'key_0', label: 'Key 1' },
+    { key: s.coachApiKey2, id: 'key_1', label: 'Key 2' },
+    { key: s.coachApiKey3, id: 'key_2', label: 'Key 3' },
+    { key: s.coachApiKey4, id: 'key_3', label: 'Key 4' },
+    { key: s.coachApiKey5, id: 'key_4', label: 'Key 5' }
+  ].filter(k => k.key && k.key.trim());
+
+  if (!allKeys.length) {
+    throw new Error('Koi bhi API key configure nahi hai. Settings mein Gemini API key add karo.');
+  }
+
+  const model         = s.geminiModel || 'gemini-2.5-flash';
+  const searchEnabled = s.geminiSearchEnabled !== false;
+
+  let lastError = null;
+  // Start from round-robin index, cycle through ALL keys
+  const startIdx = _apiRoundRobinIdx % allKeys.length;
+
+  for (let attempt = 0; attempt < allKeys.length; attempt++) {
+    const idx = (startIdx + attempt) % allKeys.length;
+    const k   = allKeys[idx];
+
+    // Check daily/per-minute limits for this key
+    const todayStr  = getTodayStr();
+    const minuteStr = todayStr + 'T' + getNowISTHHMM();
+    const stats   = (s.apiKeyStats || {})[k.id] || {};
+    const rpdUsed = (stats.rpd && stats.rpd.date   === todayStr)  ? stats.rpd.count  : 0;
+    const rpmUsed = (stats.rpm && stats.rpm.minute === minuteStr) ? stats.rpm.count  : 0;
+    if (rpdUsed >= API_KEY_RPD_SAFE) continue; // day limit — skip silently
+    if (rpmUsed >= API_KEY_RPM_SAFE) continue; // minute limit — skip silently
+
+    // Track usage before fetch
+    trackApiKeyUsage(k.id);
+    _apiRoundRobinIdx = (idx + 1) % allKeys.length;
+
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${k.key}`;
+    const body = {
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: userContent }] }],
+      generationConfig: {
+        temperature: 0.85,
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    };
+    if (searchEnabled) {
+      body.tools = [{ google_search: {} }];
+    }
+
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      if (!response.ok) {
+        const errData = await response.json().catch(() => ({}));
+        const errMsg  = errData.error?.message || `HTTP ${response.status}`;
+        if (response.status === 429) markKeyRateLimited(k.id); // immediately mark RPM exhausted
+        lastError = new Error(`[${k.label}] ${errMsg}`);
+        continue; // silently try next key
+      }
+
+      const data  = await response.json();
+      const parts = data.candidates?.[0]?.content?.parts || [];
+      const text  = parts.map(p => p.text || '').join('') || '';
+      if (!text) {
+        lastError = new Error(`[${k.label}] Empty response from API`);
+        continue; // try next key
+      }
+      return text; // ✅ success
+
+    } catch (fetchErr) {
+      lastError = new Error(`[${k.label}] Network error: ${fetchErr.message}`);
+      continue; // silently try next key
+    }
+  }
+
+  // All keys exhausted — NOW show error
+  throw new Error(lastError
+    ? lastError.message + '\n\nSab API keys try ho gayi. Thodi der baad try karo ya nayi key add karo.'
+    : 'Sab API keys ka daily/per-minute limit hit ho gaya. Thodi der baad try karo ya nayi key add karo.');
+}
+
+// Legacy alias
 const callGroqAPI = callGeminiAPI;
 
 /* ═══════════════════════════════════════════════════════════════
@@ -3731,33 +3997,9 @@ async function sendCustomReport() {
    checkAutoCoachTriggers — called inside checkNotifications()
 ───────────────────────────────────────────── */
 function checkAutoCoachTriggers(hhmm) {
-  if (!hasAnyApiKey()) return;
-
-  // Standard auto-check times
-  if (appData.settings.autoCoachEnabled) {
-    const times = appData.settings.autoCoachTimes || [];
-    times.forEach(entry => {
-      if (!entry.enabled) return;
-      if (entry.time !== hhmm) return;
-
-      const fireKey = getTodayStr() + '_' + entry.time;
-      if (appData.settings.lastAutoCoachFired && appData.settings.lastAutoCoachFired[fireKey]) return;
-
-      if (!appData.settings.lastAutoCoachFired) appData.settings.lastAutoCoachFired = {};
-      appData.settings.lastAutoCoachFired[fireKey] = true;
-      saveData();
-
-      runAutoCoachReport(entry.time).catch(err => {
-        console.warn('Auto-coach failed:', err.message);
-      });
-    });
-  }
-
-  // Weekly overall report (every 7 days)
-  checkWeeklyReportTrigger(hhmm);
-
-  // Daily progress report (from Day 1 to now)
-  checkDailyProgressTrigger(hhmm);
+  // AUTO API CALLS REMOVED — notifications are pre-scheduled via scheduleAllCapacitorNotifications()
+  // Inbox entries are added via buildMissedInboxEntries() on app open
+  // No-op: kept for reference only
 }
 
 /* ─────────────────────────────────────────────
@@ -3848,24 +4090,24 @@ Full detailed reality check response (task-by-task analysis, working window, eff
   if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
   saveData();
 
-  // ── Deliver: ALWAYS fire native notification (app open, background, or killed) ──
-  // App2 behaviour: notification fires regardless of app state.
-  // If app is also open → additionally update UI + show toast.
-  const capFiredEgo = await fireCapacitorNativeNotif(
-    '🧠 ' + headline,
-    notifBody,
-    'aainik-ego',
-    'auto'
-  );
-  if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
-
-  // If app is open/foreground → also refresh UI
+  // ── Decide how to deliver the response based on app state ──
   if (_appInForeground) {
+    // App is OPEN → show directly in UI, no notification
     if (currentScreen === 'coach') {
       switchCoachTab('ego');
       renderCoachScreen();
     }
-    showToast(`🧠 Ego: ${headline.substring(0, 60)}`);
+    if (currentScreen === 'inbox') renderInboxScreen();
+    showToast(`🧠 Ego: ${headline.substring(0, 60)}`, true);
+  } else {
+    // App is in BACKGROUND → fire native notification with real Gemini response
+    const capFiredEgo = await fireCapacitorNativeNotif(
+      '🧠 ' + headline,
+      notifBody,
+      'aainik-ego',
+      'auto'
+    );
+    if (!capFiredEgo) fireAiNotification(headline, notifBody, 'auto-coach-' + triggerTime, 'auto');
   }
 }
 
@@ -3920,17 +4162,17 @@ function renderAutoCoachSettings() {
   const maxInp = document.getElementById('auto-coach-max-per-day');
   if (maxInp) maxInp.value = s.autoCoachMaxPerDay || 3;
 
-  // Weekly report
-  const wkToggle = document.getElementById('weekly-report-toggle');
-  if (wkToggle) wkToggle.checked = !!s.weeklyReportEnabled;
-  const wkTime = document.getElementById('weekly-report-time');
-  if (wkTime) wkTime.value = s.weeklyReportTime || '20:00';
+  // Last 7 Days report
+  const wkToggle = document.getElementById('last7days-report-toggle');
+  if (wkToggle) wkToggle.checked = !!s.last7DaysReportEnabled;
+  const wkTime = document.getElementById('last7days-report-time');
+  if (wkTime) wkTime.value = s.last7DaysReportTime || '20:00';
 
-  // Daily progress report
-  const dpToggle = document.getElementById('daily-progress-toggle');
-  if (dpToggle) dpToggle.checked = !!s.dailyProgressEnabled;
-  const dpTime = document.getElementById('daily-progress-time');
-  if (dpTime) dpTime.value = s.dailyProgressTime || '21:30';
+  // Overall progress report
+  const dpToggle = document.getElementById('overall-progress-toggle');
+  if (dpToggle) dpToggle.checked = !!s.overallProgressEnabled;
+  const dpTime = document.getElementById('overall-progress-time');
+  if (dpTime) dpTime.value = s.overallProgressTime || '21:30';
 
   renderAutoCoachTimeList();
 }
@@ -4001,38 +4243,40 @@ function updateAutoCoachPersonality(val) {
 
 function updateAutoCoachMaxPerDay(val) {
   const n = parseInt(val);
-  if (isNaN(n) || n < 1 || n > 10) return;
+  if (isNaN(n) || n < 1 || n > 15) return;
   appData.settings.autoCoachMaxPerDay = n;
   saveData();
   renderAutoCoachTimeList();
   showToast(`✅ Max auto-checks per day: ${n}`);
 }
 
-function toggleWeeklyReport(val) {
-  appData.settings.weeklyReportEnabled = val;
+// ── Last 7 Days Report toggles (replaces old weekly) ──
+function toggleLast7DaysReport(val) {
+  appData.settings.last7DaysReportEnabled = val;
   saveData();
-  showToast(val ? '✅ Weekly report ON' : '🔕 Weekly report OFF');
-  // If enabling and already past today's configured time, fire catch-up immediately
-  if (val) setTimeout(checkMissedReports, 500);
+  showToast(val ? '✅ Last 7 Days report ON' : '🔕 Last 7 Days report OFF');
 }
+function updateLast7DaysReportTime(val) { appData.settings.last7DaysReportTime = val; saveData(); }
 
-function updateWeeklyReportTime(val) {
-  appData.settings.weeklyReportTime = val;
+// ── Overall Progress Report toggles (replaces old daily) ──
+function toggleOverallProgress(val) {
+  appData.settings.overallProgressEnabled = val;
   saveData();
+  showToast(val ? '✅ Overall Progress report ON' : '🔕 Overall Progress report OFF');
 }
+function updateOverallProgressTime(val) { appData.settings.overallProgressTime = val; saveData(); }
 
-function toggleDailyProgress(val) {
-  appData.settings.dailyProgressEnabled = val;
-  saveData();
-  showToast(val ? '✅ Daily progress report ON' : '🔕 Daily progress report OFF');
-  // If enabling and already past today's configured time, fire catch-up immediately
-  if (val) setTimeout(checkMissedReports, 500);
-}
+// ── Josh Last 7 Days + Overall toggles ──
+function toggleJoshLast7Days(val) { appData.settings.joshLast7DaysEnabled = val; saveData(); showToast(val ? '✅ Josh Last 7 Days ON' : '🔕 Josh Last 7 Days OFF'); }
+function updateJoshLast7DaysTime(val) { appData.settings.joshLast7DaysTime = val; saveData(); }
+function toggleJoshOverallProgress(val) { appData.settings.joshOverallProgressEnabled = val; saveData(); showToast(val ? '✅ Josh Overall Progress ON' : '🔕 Josh Overall Progress OFF'); }
+function updateJoshOverallProgressTime(val) { appData.settings.joshOverallProgressTime = val; saveData(); }
 
-function updateDailyProgressTime(val) {
-  appData.settings.dailyProgressTime = val;
-  saveData();
-}
+// Legacy aliases — kept so any old HTML references don't break
+function toggleWeeklyReport(val) { toggleLast7DaysReport(val); }
+function updateWeeklyReportTime(val) { updateLast7DaysReportTime(val); }
+function toggleDailyProgress(val) { toggleOverallProgress(val); }
+function updateDailyProgressTime(val) { updateOverallProgressTime(val); }
 
 /* ─────────────────────────────────────────────
    EGO AI MODE: WEEKLY REPORT TRIGGER
@@ -4130,204 +4374,137 @@ function fireAiNotification(title, fullResponse, tag, convType) {
 }
 
 /* ─────────────────────────────────────────────
-   checkMissedReports — catch-up for weekly/daily reports
-   Called on app init: if a report was supposed to fire today/this week
-   but the app was closed at that time, fire it now.
+   buildMissedInboxEntries
+   On app open: check which ego/josh scheduled times
+   passed today while app was closed. Add them to inbox
+   so user can see them and tap "Read More".
+   NO API calls here — purely data/UI.
 ───────────────────────────────────────────── */
-function checkMissedReports() {
-  if (!hasAnyApiKey()) return;
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
+function buildMissedInboxEntries() {
+  const today    = getTodayStr();           // IST date
+  const nowHHMM  = getNowISTHHMM();         // IST HH:MM
+  const s        = appData.settings;
 
-  const now    = new Date();
-  const hhmm   = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
-  const today  = getTodayStr();
-  const s      = appData.settings;
+  // ── Single-day rule: purge entries from previous days on every app open ──
+  if (!appData.egoInbox)  appData.egoInbox  = [];
+  if (!appData.joshInbox) appData.joshInbox = [];
+  appData.egoInbox  = appData.egoInbox.filter(e => e.date === today);
+  appData.joshInbox = appData.joshInbox.filter(e => e.date === today);
 
-  // ── Weekly report catch-up ──
-  if (s.weeklyReportEnabled && s.weeklyReportTime && hhmm >= s.weeklyReportTime) {
-    const weekKey = getISOWeekKey(now);
-    if (!s.lastWeeklyReportFired || !s.lastWeeklyReportFired[weekKey]) {
-      if (!s.lastWeeklyReportFired) s.lastWeeklyReportFired = {};
-      s.lastWeeklyReportFired[weekKey] = true;
-      saveData();
-      setTimeout(() => {
-        runWeeklyReport().catch(err => console.warn('Weekly catch-up failed:', err.message));
-      }, 4000);
-    }
-  }
-
-  // ── Daily progress catch-up ──
-  if (s.dailyProgressEnabled && s.dailyProgressTime && hhmm >= s.dailyProgressTime) {
-    if (!s.lastDailyProgressFired || !s.lastDailyProgressFired[today]) {
-      if (!s.lastDailyProgressFired) s.lastDailyProgressFired = {};
-      s.lastDailyProgressFired[today] = true;
-      saveData();
-      setTimeout(() => {
-        runDailyProgressReport().catch(err => console.warn('Daily progress catch-up failed:', err.message));
-      }, 7000);
-    }
-  }
-}
-
-/* ─────────────────────────────────────────────
-   MISSED RESPONSE QUEUE SYSTEM
-   When app was killed and pre-scheduled notifications (Ego/Josh)
-   fired, user gets static placeholder text. On return to app,
-   we build a queue of the missed Gemini responses and fire them
-   one-by-one with 1-minute gaps so user gets real AI content.
-───────────────────────────────────────────── */
-
-/**
- * Check if a HH:MM time string fell inside [fromMs, toMs] window today.
- */
-function _wasTimeDueInWindow(timeStr, fromMs, toMs) {
-  const [h, m] = (timeStr || '00:00').split(':').map(Number);
-  const now = new Date();
-  const candidate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0, 0).getTime();
-  return candidate > fromMs && candidate <= toMs;
-}
-
-/**
- * Build queue of Ego/Josh responses missed while app was killed.
- * Called once on app start if _appWasKilled is true.
- */
-function buildMissedResponseQueue() {
-  if (!_appWasKilled) return;
-  if (!hasAnyApiKey()) return;
-  if (!('Notification' in window) || Notification.permission !== 'granted') return;
-
-  const now   = Date.now();
-  const today = getTodayStr();
-  const s     = appData.settings;
-
-  // ── Smart day-bound queue ──
-  // Queue only contains responses for TODAY.
-  // If app was killed yesterday (or earlier), those slots are a different
-  // day — purge them from pending and mark as skipped so they never fire.
-  // Rule: if the scheduled HH:MM belongs to today's date → queue it.
-  //       if it belongs to a past date → mark fired, discard silently.
-
-  // "Today midnight" in ms — anything before this = yesterday or older
-  const todayMidnight = (() => {
-    const d = new Date();
-    d.setHours(0, 0, 0, 0);
-    return d.getTime();
-  })();
-
-  // Current time as "HH:MM" — only queue times that have already passed today
-  const nowHHMM = String(new Date().getHours()).padStart(2,'0') + ':' +
-                  String(new Date().getMinutes()).padStart(2,'0');
-
-  let lastBeat;
-  try {
-    lastBeat = parseInt(localStorage.getItem('_aainik_heartbeat') || '0');
-  } catch(e) { lastBeat = 0; }
-
-  // Was the last heartbeat from a previous day?
-  const lastBeatWasYesterday = lastBeat > 0 && lastBeat < todayMidnight;
-
-  let skippedOldDay = 0;
-
-  // ── Ego missed responses ──
+  // Ego inbox entries (auto-check times)
   if (s.autoCoachEnabled) {
     (s.autoCoachTimes || []).forEach(entry => {
       if (!entry.enabled || !entry.time) return;
-      const todayFireKey = today + '_' + entry.time;
-
-      // Already ran today? skip
-      if (s.lastAutoCoachFired && s.lastAutoCoachFired[todayFireKey]) return;
-
-      if (lastBeatWasYesterday) {
-        // App was killed before midnight — yesterday's pending slots are stale.
-        // Mark them as done so they never queue again, then skip.
-        if (!s.lastAutoCoachFired) s.lastAutoCoachFired = {};
-        s.lastAutoCoachFired[todayFireKey] = true;
-        skippedOldDay++;
-        return;
-      }
-
-      // App was killed today — only queue times that have passed since last heartbeat
-      if (entry.time > nowHHMM) return;           // hasn't fired yet today, skip
-      if (!_wasTimeDueInWindow(entry.time, lastBeat, now)) return; // outside missed window
-
-      _pendingAutoQueue.push({ type: 'ego', time: entry.time });
+      if (entry.time > nowHHMM) return; // hasn't fired yet today
+      addEgoInboxEntry(entry.time, today, /*silent=*/true);
     });
   }
 
-  // ── Josh missed responses ──
+  // Ego Last 7 Days inbox entry
+  if (s.last7DaysReportEnabled && s.last7DaysReportTime && s.last7DaysReportTime <= nowHHMM) {
+    addEgoInboxEntry('last7days_' + today, today, /*silent=*/true);
+  }
+
+  // Ego Overall Progress inbox entry
+  if (s.overallProgressEnabled && s.overallProgressTime && s.overallProgressTime <= nowHHMM) {
+    addEgoInboxEntry('overall_' + today, today, /*silent=*/true);
+  }
+
+  // Josh inbox entries (auto-reminder times)
   if (s.joshAutoEnabled) {
     (s.joshAutoTimes || []).forEach(entry => {
       if (!entry.enabled || !entry.time) return;
-      const todayFireKey = today + '_' + entry.time;
-
-      if (s.lastJoshAutoFired && s.lastJoshAutoFired[todayFireKey]) return;
-
-      if (lastBeatWasYesterday) {
-        if (!s.lastJoshAutoFired) s.lastJoshAutoFired = {};
-        s.lastJoshAutoFired[todayFireKey] = true;
-        skippedOldDay++;
-        return;
-      }
-
       if (entry.time > nowHHMM) return;
-      if (!_wasTimeDueInWindow(entry.time, lastBeat, now)) return;
-
-      _pendingAutoQueue.push({ type: 'josh', time: entry.time });
+      addJoshInboxEntry(entry.time, today, /*silent=*/true);
     });
   }
 
-  if (skippedOldDay > 0) saveData(); // persist the "already fired" marks
-
-  if (_pendingAutoQueue.length > 0) {
-    console.log('Aainik: ' + _pendingAutoQueue.length + ' missed response(s) queued for today' +
-      (skippedOldDay > 0 ? ' | ' + skippedOldDay + ' from previous day(s) discarded' : ''));
-    showToast('🔄 ' + _pendingAutoQueue.length + ' missed response' +
-      (_pendingAutoQueue.length > 1 ? 's' : '') + ' process ho rahi hain...');
-    processAutoResponseQueue();
-  } else {
-    console.log('Aainik: No missed responses for today' +
-      (skippedOldDay > 0 ? ' (' + skippedOldDay + ' from previous day(s) discarded)' : ''));
+  // Josh Last 7 Days inbox entry
+  if (s.joshLast7DaysEnabled && s.joshLast7DaysTime && s.joshLast7DaysTime <= nowHHMM) {
+    addJoshInboxEntry('jlast7days_' + today, today, /*silent=*/true);
   }
+
+  // Josh Overall Progress inbox entry
+  if (s.joshOverallProgressEnabled && s.joshOverallProgressTime && s.joshOverallProgressTime <= nowHHMM) {
+    addJoshInboxEntry('joverall_' + today, today, /*silent=*/true);
+  }
+
+  saveData();
+  // Re-render whichever screen is open
+  if (currentScreen === 'coach') renderCoachScreen();
+  if (currentScreen === 'inbox') renderInboxScreen();
 }
 
-/**
- * Process one item from the pending queue, then schedule next after 1 minute.
- */
-function processAutoResponseQueue() {
-  if (_queueProcessing || _pendingAutoQueue.length === 0) return;
-  _queueProcessing = true;
-
-  const item = _pendingAutoQueue.shift();
-
-  const runFn = item.type === 'ego' ? runAutoCoachReport : runJoshAutoReminder;
-
-  runFn(item.time)
-    .catch(err => console.warn('Aainik: Queue item failed:', err.message))
-    .finally(() => {
-      _queueProcessing = false;
-      if (_pendingAutoQueue.length > 0) {
-        // 1 minute gap between each queued response
-        setTimeout(processAutoResponseQueue, 60000);
-      }
-    });
-}
-
-function checkWeeklyReportTrigger(hhmm) {
+/* ─────────────────────────────────────────────
+   EGO: LAST 7 DAYS REPORT TRIGGER
+   Fires DAILY at configured time — last 7 days data
+───────────────────────────────────────────── */
+function checkLast7DaysReportTrigger(hhmm) {
   const s = appData.settings;
-  if (!s.weeklyReportEnabled) return;
-  if (!hasAnyApiKey())         return;
-  if (s.weeklyReportTime !== hhmm) return;
+  if (!s.last7DaysReportEnabled) return;
+  if (!hasAnyApiKey())            return;
+  if (s.last7DaysReportTime !== hhmm) return;
 
-  // Use ISO week number as key to fire once per week
-  const now      = new Date();
-  const weekKey  = getISOWeekKey(now);
-  if (s.lastWeeklyReportFired && s.lastWeeklyReportFired[weekKey]) return;
+  const today = getTodayStr();
+  if (s.lastLast7DaysReportFired && s.lastLast7DaysReportFired[today]) return;
 
-  if (!s.lastWeeklyReportFired) s.lastWeeklyReportFired = {};
-  s.lastWeeklyReportFired[weekKey] = true;
+  if (!s.lastLast7DaysReportFired) s.lastLast7DaysReportFired = {};
+  s.lastLast7DaysReportFired[today] = true;
   saveData();
 
-  runWeeklyReport().catch(err => console.warn('Weekly report failed:', err.message));
+  runLast7DaysReport().catch(err => console.warn('Last 7 days report failed:', err.message));
+}
+
+/* ─────────────────────────────────────────────
+   EGO: OVERALL PROGRESS TRIGGER
+   Fires daily at configured time — all-time data
+───────────────────────────────────────────── */
+function checkOverallProgressTrigger(hhmm) {
+  const s = appData.settings;
+  if (!s.overallProgressEnabled) return;
+  if (!hasAnyApiKey())            return;
+  if (s.overallProgressTime !== hhmm) return;
+
+  const today = getTodayStr();
+  if (s.lastOverallProgressFired && s.lastOverallProgressFired[today]) return;
+
+  if (!s.lastOverallProgressFired) s.lastOverallProgressFired = {};
+  s.lastOverallProgressFired[today] = true;
+  saveData();
+
+  runOverallProgressReport().catch(err => console.warn('Overall progress failed:', err.message));
+}
+
+/* ─────────────────────────────────────────────
+   JOSH: LAST 7 DAYS REPORT TRIGGER
+───────────────────────────────────────────── */
+function checkJoshLast7DaysTrigger(hhmm) {
+  const s = appData.settings;
+  if (!s.joshLast7DaysEnabled) return;
+  if (!hasAnyApiKey())          return;
+  if (s.joshLast7DaysTime !== hhmm) return;
+  const today = getTodayStr();
+  if (s.lastJoshLast7DaysFired && s.lastJoshLast7DaysFired[today]) return;
+  if (!s.lastJoshLast7DaysFired) s.lastJoshLast7DaysFired = {};
+  s.lastJoshLast7DaysFired[today] = true;
+  saveData();
+  runJoshLast7DaysReport().catch(err => console.warn('Josh last7 failed:', err.message));
+}
+
+/* ─────────────────────────────────────────────
+   JOSH: OVERALL PROGRESS TRIGGER
+───────────────────────────────────────────── */
+function checkJoshOverallProgressTrigger(hhmm) {
+  const s = appData.settings;
+  if (!s.joshOverallProgressEnabled) return;
+  if (!hasAnyApiKey())                return;
+  if (s.joshOverallProgressTime !== hhmm) return;
+  const today = getTodayStr();
+  if (s.lastJoshOverallProgressFired && s.lastJoshOverallProgressFired[today]) return;
+  if (!s.lastJoshOverallProgressFired) s.lastJoshOverallProgressFired = {};
+  s.lastJoshOverallProgressFired[today] = true;
+  saveData();
+  runJoshOverallProgressReport().catch(err => console.warn('Josh overall failed:', err.message));
 }
 
 function getISOWeekKey(date) {
@@ -4339,56 +4516,231 @@ function getISOWeekKey(date) {
   return `${d.getUTCFullYear()}-W${String(week).padStart(2, '0')}`;
 }
 
-async function runWeeklyReport() {
+/* ─────────────────────────────────────────────
+   EGO: RUN LAST 7 DAYS REPORT
+   Gets last 7 days of data and sends to Ego
+───────────────────────────────────────────── */
+async function runLast7DaysReport() {
   const today = getTodayStr();
   const data  = getCoachData();
-  data.report_type = 'weekly_overall';
+  data.report_type = 'last7days_progress';
 
-  // Build 7-day summary — yesterday to 7 days ago (exclude today per spec)
   const last7 = [];
   for (let i = 7; i >= 1; i--) {
     const d = dateNDaysAgo(i);
     const ds = getDailyScore(d);
-    last7.push({ date: d, score: ds.score, done: ds.done, total: ds.total });
+    last7.push({ date: d, score: ds.score, done: ds.done, total: ds.taskCount });
   }
   data.last7days = last7;
+  const avgLast7 = last7.length ? Math.round(last7.reduce((a, b) => a + b.score, 0) / last7.length) : 0;
 
-  const personality = appData.settings.autoCoachPersonality || 'beast';
-  const avgWeekly   = last7.length ? Math.round(last7.reduce((a, b) => a + b.score, 0) / last7.length) : 0;
+  // Attach last ego response for context
+  const lastEgoResp = getLastEgoResponse();
+  const lastRespNote = lastEgoResp
+    ? `\n\nMERI LAST RESPONSE (jo maine pichli baar kahi thi — cross-check karo kya user ne follow kiya):\n"${lastEgoResp.substring(0, 500)}"\n\nIs last response ko context ke roop mein use karo — kya user ne meri advice follow ki? Accordingly react karo.`
+    : '';
 
-  // Use full buildSystemPrompt() — same workflow as manual coach
   const systemPrompt = buildSystemPrompt();
-  const weeklyContext = `\n\nWEEKLY REPORT MODE (last 7 days — aaj se pehle, aaj ka din exclude):\nWeekly Average: ${avgWeekly}%\nDin-by-din breakdown:\n${last7.map(d => `${d.date}: ${d.score}% (${d.done}/${d.total} tasks done)`).join('\n')}\n\nIs 7 din ka full reality check de. Kab strong raha, kab gira — seedha bolta hai. Pattern dekh. Next hafte ke liye 2-3 specific actionable goals bata. Format:\nLine 1: Ek punchy title/headline (notification ke liye — max 90 chars, personal aur direct)\nBlank line\nFull weekly reality check response (as per teri personality aur score-based brutality rules)`;
+  const context = `\n\nLAST 7 DAYS PROGRESS REPORT:\nAverage: ${avgLast7}%\nDay-by-day:\n${last7.map(d => `${d.date}: ${d.score}% (${d.done}/${d.total} tasks)`).join('\n')}\n\nLast 7 din ka full reality check de.\nFormat:\nLine 1: Punchy headline (max 90 chars)\nBlank line\nFull response${lastRespNote}`;
 
-  const fullResponse = await callGeminiAPI(systemPrompt, weeklyContext + '\n\n' + JSON.stringify(data), 800);
-
-  const lines    = fullResponse.trim().split('\n').filter(l => l.trim());
-  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📊 Tera-Ego Weekly Report!';
+  const fullResponse = await callGeminiAPI(systemPrompt, context + '\n\n' + JSON.stringify(data), 800);
+  const lines = fullResponse.trim().split('\n').filter(l => l.trim());
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Ego: Last 7 days reality check!';
   const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
 
-  // Fire notification — 4-5 line AI summary in notification body
-  const capFiredWeekly = await fireCapacitorNativeNotif(
-    '📊 ' + headline,
-    notifBody,
-    'aainik-ego',
-    'weekly'
-  );
-  if (!capFiredWeekly) fireAiNotification(headline, notifBody, 'weekly-report-' + getISOWeekKey(new Date()), 'weekly');
+  // Save inbox entry
+  const inboxTrigger = 'last7days_' + today;
+  addEgoInboxEntry(inboxTrigger, today, true);
+  const inboxEntry = (appData.egoInbox || []).find(e => e.id === 'ego_inbox_' + today + '_' + inboxTrigger);
+  if (inboxEntry) {
+    inboxEntry.response = fullResponse;
+    inboxEntry.status   = 'read';
+    inboxEntry.triggerLabel = 'Last 7 Days Progress';
+  }
 
   // Save to conversations
   if (!appData.conversations) appData.conversations = [];
   appData.conversations.unshift({
-    id: 'conv_weekly_' + Date.now(), type: 'weekly',
+    id: 'conv_last7_' + Date.now(), type: 'last7days',
     timestamp: Date.now(), date: today,
-    scoreLabel: `📊 Weekly Report — Avg: ${avgWeekly}%`,
-    response: fullResponse, headline,
-    personality
+    scoreLabel: `📊 Last 7 Days — Avg: ${avgLast7}%`,
+    response: fullResponse, headline
   });
   if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
   saveData();
 
+  const capFired = await fireCapacitorNativeNotif('📊 ' + headline, notifBody, 'aainik-ego', 'last7days');
+  if (!capFired) fireAiNotification(headline, notifBody, 'last7days-' + today, 'last7days');
+
   if (currentScreen === 'coach') renderCoachScreen();
-  showToast(`📊 Weekly report: ${headline.substring(0, 50)}...`);
+  if (currentScreen === 'inbox') renderInboxScreen();
+  showToast(`📊 Last 7 days: ${headline.substring(0, 50)}...`, true);
+}
+
+/* ─────────────────────────────────────────────
+   EGO: RUN OVERALL PROGRESS REPORT
+   Day 1 to now — all-time journey assessment
+───────────────────────────────────────────── */
+async function runOverallProgressReport() {
+  const today = getTodayStr();
+  const data  = getCoachData();
+  data.report_type = 'overall_progress';
+
+  // All-time summary — exclude today
+  const allDates = [...new Set(appData.history.map(h => h.date))].sort().filter(d => d < today);
+  const totalDays = allDates.length;
+  const scores    = allDates.map(d => getDailyScore(d).score);
+  const allTimeAvg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+  const bestScore  = scores.length ? Math.max(...scores) : 0;
+  const worstScore = scores.length ? Math.min(...scores) : 0;
+  const bestDay    = allDates[scores.indexOf(Math.max(...scores, 0))] || 'N/A';
+  const worstDay   = allDates[scores.indexOf(Math.min(...scores, 100))] || 'N/A';
+
+  data.all_time_summary = { totalDays, allTimeAvg, bestScore, worstScore, firstDay: allDates[0] || today, bestDay, worstDay };
+
+  const lastEgoResp = getLastEgoResponse();
+  const lastRespNote = lastEgoResp
+    ? `\n\nMERI LAST RESPONSE:\n"${lastEgoResp.substring(0, 500)}"\n\nIs last response ko context ke roop mein use karo.`
+    : '';
+
+  const systemPrompt = buildSystemPrompt();
+  const overallContext = `\n\nOVERALL PROGRESS REPORT MODE (Day 1 se kal tak — aaj ka din exclude):\nTotal days tracked: ${totalDays} | All-time average: ${allTimeAvg}% | Best: ${bestScore}% (${bestDay}) | Worst: ${worstScore}% (${worstDay}) | Journey started: ${allDates[0] || 'N/A'}\n\nPoori journey ka seedha honest assessment de. Format:\nLine 1: Ek punchy headline title (max 90 chars)\nBlank line\nFull overall progress reality check${lastRespNote}`;
+
+  const fullResponse = await callGeminiAPI(systemPrompt, overallContext + '\n\n' + JSON.stringify(data), 800);
+  const lines    = fullResponse.trim().split('\n').filter(l => l.trim());
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Ego Overall Progress!';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
+
+  // Save inbox entry
+  const inboxTrigger = 'overall_' + today;
+  addEgoInboxEntry(inboxTrigger, today, true);
+  const inboxEntry = (appData.egoInbox || []).find(e => e.id === 'ego_inbox_' + today + '_' + inboxTrigger);
+  if (inboxEntry) {
+    inboxEntry.response = fullResponse;
+    inboxEntry.status   = 'read';
+    inboxEntry.triggerLabel = 'Overall Progress';
+  }
+
+  if (!appData.conversations) appData.conversations = [];
+  appData.conversations.unshift({
+    id: 'conv_overall_prog_' + Date.now(), type: 'overall_progress',
+    timestamp: Date.now(), date: today,
+    scoreLabel: `📈 Overall Progress — ${totalDays} days | Avg: ${allTimeAvg}%`,
+    response: fullResponse, headline
+  });
+  if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
+  saveData();
+
+  const capFired = await fireCapacitorNativeNotif('📈 ' + headline, notifBody, 'aainik-ego', 'overall_progress');
+  if (!capFired) fireAiNotification(headline, notifBody, 'overall-progress-' + today, 'overall_progress');
+
+  if (currentScreen === 'coach') renderCoachScreen();
+  if (currentScreen === 'inbox') renderInboxScreen();
+  showToast(`📈 Overall progress: ${headline.substring(0, 50)}...`, true);
+}
+
+/* ─────────────────────────────────────────────
+   JOSH: RUN LAST 7 DAYS REPORT
+───────────────────────────────────────────── */
+async function runJoshLast7DaysReport() {
+  const today = getTodayStr();
+  const last7 = [];
+  for (let i = 7; i >= 1; i--) {
+    const d = dateNDaysAgo(i);
+    const ds = getDailyScore(d);
+    last7.push({ date: d, score: ds.score, done: ds.done, total: ds.taskCount });
+  }
+  const avgLast7 = last7.length ? Math.round(last7.reduce((a, b) => a + b.score, 0) / last7.length) : 0;
+
+  const lastJoshResp = getLastJoshResponse();
+  const lastJoshNote = lastJoshResp
+    ? `\n\nMERI LAST RESPONSE:\n"${lastJoshResp.substring(0, 500)}"\n\nIs context ko use karo — kya user ne progress ki?`
+    : '';
+
+  const systemPrompt = getJoshActivePrompt();
+  const content = `JOSH LAST 7 DAYS REMINDER:\nAverage: ${avgLast7}%\n${last7.map(d => `${d.date}: ${d.score}%`).join('\n')}\nLife Goals: ${(appData.settings.egoLifeGoals||'').trim()||'Not set'}\nMotivate the user about their last 7 days performance and what to do this week.\nFormat:\nLine 1: Punchy motivational headline (max 90 chars, Hinglish)\nBlank line\nFull detailed response${lastJoshNote}`;
+
+  const fullResponse = await callGeminiAPI(systemPrompt, content, 600);
+  const lines = fullResponse.trim().split('\n').filter(l => l.trim());
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Josh: Last 7 days — chal aage badhte hain!';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
+
+  // Save inbox entry
+  const inboxTrigger = 'jlast7days_' + today;
+  addJoshInboxEntry(inboxTrigger, today, true);
+  const inboxEntry = (appData.joshInbox || []).find(e => e.id === 'josh_inbox_' + today + '_' + inboxTrigger);
+  if (inboxEntry) {
+    inboxEntry.response = fullResponse;
+    inboxEntry.status   = 'read';
+    inboxEntry.triggerLabel = 'Last 7 Days Progress';
+  }
+
+  if (!appData.joshConversations) appData.joshConversations = [];
+  appData.joshConversations.unshift({
+    id: 'jc_last7_' + Date.now(), type: 'last7days',
+    timestamp: Date.now(), date: today,
+    scoreLabel: `📊 Josh Last 7 Days — Avg: ${avgLast7}%`,
+    response: fullResponse, headline
+  });
+  if (appData.joshConversations.length > 30) appData.joshConversations = appData.joshConversations.slice(0, 30);
+  saveData();
+
+  const capFired = await fireCapacitorNativeNotif('📊 ' + headline, notifBody, 'aainik-josh', 'josh_last7days');
+  if (!capFired) fireAiNotification(headline, notifBody, 'josh-last7-' + today, 'josh_last7days');
+
+  if (currentScreen === 'coach') renderCoachScreen();
+  if (currentScreen === 'inbox') renderInboxScreen();
+  showToast(`📊 Josh Last 7 days: ${headline.substring(0, 50)}...`, true);
+}
+
+/* ─────────────────────────────────────────────
+   JOSH: RUN OVERALL PROGRESS REPORT
+───────────────────────────────────────────── */
+async function runJoshOverallProgressReport() {
+  const today = getTodayStr();
+  const allDates = [...new Set(appData.history.map(h => h.date))].sort().filter(d => d < today);
+  const scores   = allDates.map(d => getDailyScore(d).score);
+  const allTimeAvg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
+
+  const lastJoshResp = getLastJoshResponse();
+  const lastJoshNote = lastJoshResp
+    ? `\n\nMERI LAST RESPONSE:\n"${lastJoshResp.substring(0, 500)}"\n\nIs context ko use karo.`
+    : '';
+
+  const systemPrompt = getJoshActivePrompt();
+  const content = `JOSH OVERALL PROGRESS SUMMARY:\nTotal days tracked: ${allDates.length} | All-time avg: ${allTimeAvg}%\nLife Goals: ${(appData.settings.egoLifeGoals||'').trim()||'Not set'}\nGive a powerful overall progress motivation and direction.\nFormat:\nLine 1: Punchy headline (max 90 chars)\nBlank line\nFull response${lastJoshNote}`;
+
+  const fullResponse = await callGeminiAPI(systemPrompt, content, 600);
+  const lines = fullResponse.trim().split('\n').filter(l => l.trim());
+  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || 'Josh: Overall progress — aage badhna hai!';
+  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
+
+  // Save inbox entry
+  const inboxTrigger = 'joverall_' + today;
+  addJoshInboxEntry(inboxTrigger, today, true);
+  const inboxEntry = (appData.joshInbox || []).find(e => e.id === 'josh_inbox_' + today + '_' + inboxTrigger);
+  if (inboxEntry) {
+    inboxEntry.response = fullResponse;
+    inboxEntry.status   = 'read';
+    inboxEntry.triggerLabel = 'Overall Progress';
+  }
+
+  if (!appData.joshConversations) appData.joshConversations = [];
+  appData.joshConversations.unshift({
+    id: 'jc_overall_' + Date.now(), type: 'overall_progress',
+    timestamp: Date.now(), date: today,
+    scoreLabel: `📈 Josh Overall Progress — Avg: ${allTimeAvg}%`,
+    response: fullResponse, headline
+  });
+  if (appData.joshConversations.length > 30) appData.joshConversations = appData.joshConversations.slice(0, 30);
+  saveData();
+
+  const capFired = await fireCapacitorNativeNotif('📈 ' + headline, notifBody, 'aainik-josh', 'josh_overall');
+  if (!capFired) fireAiNotification(headline, notifBody, 'josh-overall-' + today, 'josh_overall');
+
+  if (currentScreen === 'coach') renderCoachScreen();
+  if (currentScreen === 'inbox') renderInboxScreen();
+  showToast(`📈 Josh Overall: ${headline.substring(0, 50)}...`, true);
 }
 
 function buildWeeklyReportPrompt(avgScore, personality) {
@@ -4402,88 +4754,21 @@ function buildWeeklyReportPrompt(avgScore, personality) {
   }
   return `${tone}
 
-User ka WEEKLY OVERALL PERFORMANCE REPORT aa gaya hai (7 din ka).
-Average weekly score: ${avgScore}%.
+User ka LAST 7 DAYS OVERALL PERFORMANCE REPORT aa gaya hai.
+Average score: ${avgScore}%.
 
 2 parts likhna:
 
 PART 1 (notification headline): EK punchy line, max 90 chars. Pattern ya insight capture karo.
 
-PART 2 (full weekly report): 5-8 sentences. Har din ka trend dekho. Strong days celebrate karo, weak days pe reality check do. Next week ke liye 2-3 specific actionable goals bolo.
+PART 2 (full report): 5-8 sentences. Har din ka trend dekho. Strong days celebrate karo, weak days pe reality check do. Next week ke liye 2-3 specific actionable goals bolo.
 
 "Part 1" / "Part 2" labels mat likhna. Blank line se separate karna.`;
 }
 
 /* ─────────────────────────────────────────────
-   EGO AI MODE: DAILY PROGRESS REPORT
-   Fires daily at configured time — overall from Day 1 to now
+   buildDailyProgressPrompt — kept for backward compat
 ───────────────────────────────────────────── */
-function checkDailyProgressTrigger(hhmm) {
-  const s = appData.settings;
-  if (!s.dailyProgressEnabled) return;
-  if (!hasAnyApiKey())          return;
-  if (s.dailyProgressTime !== hhmm) return;
-
-  const today   = getTodayStr();
-  const fireKey = today;
-  if (s.lastDailyProgressFired && s.lastDailyProgressFired[fireKey]) return;
-
-  if (!s.lastDailyProgressFired) s.lastDailyProgressFired = {};
-  s.lastDailyProgressFired[fireKey] = true;
-  saveData();
-
-  runDailyProgressReport().catch(err => console.warn('Daily progress report failed:', err.message));
-}
-
-async function runDailyProgressReport() {
-  const today = getTodayStr();
-  const data  = getCoachData();
-  data.report_type = 'daily_progress_overall';
-
-  // All-time summary — exclude today (Day 1 to yesterday per spec)
-  const allDates = [...new Set(appData.history.map(h => h.date))].sort().filter(d => d < today);
-  const totalDays = allDates.length;
-  const scores    = allDates.map(d => getDailyScore(d).score);
-  const allTimeAvg = scores.length ? Math.round(scores.reduce((a, b) => a + b, 0) / scores.length) : 0;
-  const bestScore  = scores.length ? Math.max(...scores) : 0;
-  const worstScore = scores.length ? Math.min(...scores) : 0;
-  const bestDay    = allDates[scores.indexOf(Math.max(...scores, 0))] || 'N/A';
-  const worstDay   = allDates[scores.indexOf(Math.min(...scores, 100))] || 'N/A';
-
-  data.all_time_summary = { totalDays, allTimeAvg, bestScore, worstScore, firstDay: allDates[0] || today, bestDay, worstDay };
-
-  // Use full buildSystemPrompt() — same workflow as manual coach
-  const systemPrompt = buildSystemPrompt();
-  const overallContext = `\n\nOVERALL PROGRESS REPORT MODE (Day 1 se kal tak — aaj ka din exclude):\nTotal days tracked: ${totalDays} | All-time average: ${allTimeAvg}% | Best: ${bestScore}% (${bestDay}) | Worst: ${worstScore}% (${worstDay}) | Journey started: ${allDates[0] || 'N/A'}\n\nPoori journey ka seedha honest assessment de — kab shuru hua, kaise chala, kahan gira, kahan utha. Specific numbers use kar. Aaj ke liye ek strong direction de. Format:\nLine 1: Ek punchy headline title (notification ke liye — max 90 chars)\nBlank line\nFull overall progress reality check (as per teri personality aur score-based brutality rules)`;
-
-  const fullResponse = await callGeminiAPI(systemPrompt, overallContext + '\n\n' + JSON.stringify(data), 800);
-
-  const lines    = fullResponse.trim().split('\n').filter(l => l.trim());
-  const headline = lines[0].replace(/[*_#]/g, '').substring(0, 90) || '📈 Tera-Ego Progress Report!';
-  const notifBody = lines.slice(1).join('\n').trim() || fullResponse.trim();
-
-  // Fire notification — 4-5 line AI summary in notification body
-  const capFiredDaily = await fireCapacitorNativeNotif(
-    '📈 ' + headline,
-    notifBody,
-    'aainik-ego',
-    'daily_progress'
-  );
-  if (!capFiredDaily) fireAiNotification(headline, notifBody, 'daily-progress-' + today, 'daily_progress');
-
-  if (!appData.conversations) appData.conversations = [];
-  appData.conversations.unshift({
-    id: 'conv_daily_prog_' + Date.now(), type: 'daily_progress',
-    timestamp: Date.now(), date: today,
-    scoreLabel: `📈 Daily Progress — ${totalDays} days | Avg: ${allTimeAvg}%`,
-    response: fullResponse, headline
-  });
-  if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
-  saveData();
-
-  if (currentScreen === 'coach') renderCoachScreen();
-  showToast(`📈 Progress report: ${headline.substring(0, 50)}...`);
-}
 
 function buildDailyProgressPrompt(allTimeAvg, totalDays, personality) {
   let tone;
@@ -4846,6 +5131,8 @@ function renderSettingsScreen() {
   renderAutoCoachSettings();
   // Account 4 (Josh): render Josh settings
   renderJoshSettings();
+  // New: Telegram settings
+  renderTelegramSettings();
 }
 
 function setTheme(theme) {
@@ -5256,17 +5543,13 @@ function startNotificationScheduler() {
 function checkNotifications() {
   if (!('Notification' in window) || Notification.permission !== 'granted') return;
 
-  const now   = new Date();
-  const today = getTodayStr();
-  const hhmm  = String(now.getHours()).padStart(2,'0') + ':' + String(now.getMinutes()).padStart(2,'0');
-  const dayOfWeek = now.getDay(); // 0=Sun, 6=Sat
+  // Use IST time for all comparisons — fixes UTC offset bugs on non-IST devices
+  const today    = getTodayStr();          // already IST
+  const hhmm     = getNowISTHHMM();        // IST HH:MM
+  const istDate  = getNowISTDate();
+  const dayOfWeek = istDate.getDay();      // 0=Sun, 6=Sat
   const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
   const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
-
-  // ── AI Reports (Ego Auto, Josh Auto, Weekly, Daily Progress) ──
-  // These run OUTSIDE the notification window gate — they have their own time configs
-  checkAutoCoachTriggers(hhmm);
-  checkJoshAutoTriggers(hhmm);
 
   // ── Task reminders — respect notification window ──
   const notifWindow = appData.settings;
@@ -5307,6 +5590,12 @@ function checkNotifications() {
 
   // Account 2: Working window expiry check
   checkWorkingWindowExpiry();
+
+  // Ego + Josh auto-report triggers (web/PWA fallback — Capacitor uses pre-scheduled)
+  checkLast7DaysReportTrigger(hhmm);
+  checkOverallProgressTrigger(hhmm);
+  checkJoshLast7DaysTrigger(hhmm);
+  checkJoshOverallProgressTrigger(hhmm);
 }
 
 /* ─────────────────────────────────────────────
@@ -5788,12 +6077,14 @@ function showConfirmModal(title, msg, onConfirm) {
    TOAST
 ───────────────────────────────────────────── */
 let toastTimer = null;
-function showToast(msg) {
+function showToast(msg, isGold) {
   const el = document.getElementById('toast');
   el.textContent = msg;
   el.classList.remove('hidden');
+  if (isGold) el.classList.add('toast-gold');
+  else el.classList.remove('toast-gold');
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.add('hidden'), 2500);
+  toastTimer = setTimeout(() => { el.classList.add('hidden'); el.classList.remove('toast-gold'); }, 2500);
 }
 
 /* ─────────────────────────────────────────────
@@ -5926,15 +6217,8 @@ function initApp() {
   // Account 5: Capacitor Android init (runs only inside native APK, no-op in browser)
   setTimeout(initCapacitorAndroid, 1200);
 
-  // Catch-up: fire weekly/daily reports if they were scheduled while app was closed
-  setTimeout(checkMissedReports, 5000);
-
-  // ── Missed auto-response queue (if app was killed) ──
-  // If app was killed and pre-scheduled notifications fired in the background,
-  // now that user is back — queue the real Gemini responses (1 min gap each)
-  if (_appWasKilled) {
-    setTimeout(buildMissedResponseQueue, 8000); // wait 8s for data + Capacitor to init
-  }
+  // Build inbox entries for any ego/josh times that passed while app was closed
+  setTimeout(buildMissedInboxEntries, 5000);
 }
 
 // Start the app
@@ -6224,10 +6508,6 @@ function initCapacitorAndroid() {
       if (isActive) {
         // App came to foreground — save heartbeat
         localStorage.setItem('_aainik_heartbeat', String(Date.now()));
-        // Process any queued auto-responses that built up while killed
-        if (_pendingAutoQueue.length > 0 && !_queueProcessing) {
-          setTimeout(processAutoResponseQueue, 2000);
-        }
       }
     });
   }
@@ -6349,29 +6629,97 @@ async function initCapacitorNotifications() {
       try { await LocalNotifications.createChannel(ch); } catch(e) {}
     }
 
-    // ── Handle notification tap → navigate to correct screen + tab ──
-    // Pre-scheduled Ego notifications → coach screen, Ego tab
-    // Pre-scheduled Josh notifications → coach screen, Josh tab
+    // ── Register action button types for Ego and Josh notifications ──
+    try {
+      await LocalNotifications.registerActionTypes({
+        types: [
+          {
+            id: 'ego_response_action',
+            actions: [
+              {
+                id: 'send_ego_response',
+                title: '📤 Send me ego\'s response',
+                foreground: false  // do NOT open app — handle silently in background
+              }
+            ]
+          },
+          {
+            id: 'josh_response_action',
+            actions: [
+              {
+                id: 'send_josh_response',
+                title: '📤 Send me response',
+                foreground: false  // do NOT open app — handle silently in background
+              }
+            ]
+          }
+        ]
+      });
+    } catch(e) { console.warn('Aainik: Action types registration error:', e); }
+    // ── NEW listener: handles action buttons + body taps ──
     try {
       LocalNotifications.addListener('localNotificationActionPerformed', (event) => {
-        const extra = (event.notification && event.notification.extra) || {};
-        const screen   = extra.screen   || 'coach';
+        const extra    = (event.notification && event.notification.extra) || {};
+        const actionId = event.actionId || 'tap'; // 'tap' = body tap, custom id = button
         const convType = extra.convType || extra.type || '';
+        const time     = extra.time || '';
+        const date     = extra.date || getTodayStr();
 
-        if (typeof showScreen === 'function') showScreen(screen);
-
-        // Route to correct coach tab based on notification type
-        if (screen === 'coach' && typeof switchCoachTab === 'function') {
-          if (convType === 'josh_reminder' || convType === 'josh_auto') {
-            setTimeout(() => switchCoachTab('josh'), 400);
-          } else {
-            // ego_check, auto, or any other type → Ego tab
-            setTimeout(() => switchCoachTab('ego'), 400);
-          }
-        }
-
-        // Mark fresh heartbeat since user opened app via notification
         try { localStorage.setItem('_aainik_heartbeat', String(Date.now())); } catch(e) {}
+
+        if (actionId === 'send_ego_response') {
+          // Immediately minimize app as backup (some Android skins still foreground despite foreground:false)
+          try {
+            const { App: _App } = (window.Capacitor && window.Capacitor.Plugins) || {};
+            if (_App && _App.minimizeApp) setTimeout(() => _App.minimizeApp(), 80);
+          } catch(e) {}
+          // Resolve correct triggerTime for last7days / overall notifications
+          let egoTriggerTime = time;
+          if (extra.type === 'last7days')        egoTriggerTime = 'last7days_' + date;
+          else if (extra.type === 'overall_progress') egoTriggerTime = 'overall_' + date;
+          // Pipeline runs silently in background — suppress reschedule so nearby notifications aren't cancelled
+          addEgoInboxEntry(egoTriggerTime, date, true);
+          handleNotifSendEgoResponse(egoTriggerTime, date).catch(err => {
+            console.warn('Ego send response failed:', err.message);
+          });
+
+        } else if (actionId === 'send_josh_response') {
+          // Immediately minimize app as backup
+          try {
+            const { App: _App } = (window.Capacitor && window.Capacitor.Plugins) || {};
+            if (_App && _App.minimizeApp) setTimeout(() => _App.minimizeApp(), 80);
+          } catch(e) {}
+          // Resolve correct triggerTime for last7days / overall notifications
+          let joshTriggerTime = time;
+          if (extra.type === 'josh_last7days') joshTriggerTime = 'jlast7days_' + date;
+          else if (extra.type === 'josh_overall') joshTriggerTime = 'joverall_' + date;
+          // Pipeline runs silently in background
+          addJoshInboxEntry(joshTriggerTime, date, true);
+          handleNotifSendJoshResponse(joshTriggerTime, date).catch(err => {
+            console.warn('Josh send response failed:', err.message);
+          });
+
+        } else if (convType === 'ego_check' || extra.type === 'last7days' || extra.type === 'overall_progress') {
+          // Body tap on ego notification — open inbox screen
+          addEgoInboxEntry(time, date, false);
+          if (typeof showScreen === 'function') showScreen('inbox');
+          setTimeout(() => {
+            if (typeof switchInboxTab === 'function') switchInboxTab('ego');
+          }, 400);
+
+        } else if (convType === 'josh_reminder' || extra.type === 'josh_last7days' || extra.type === 'josh_overall') {
+          // Body tap on josh notification — open inbox screen
+          addJoshInboxEntry(time, date, false);
+          if (typeof showScreen === 'function') showScreen('inbox');
+          setTimeout(() => {
+            if (typeof switchInboxTab === 'function') switchInboxTab('josh');
+          }, 400);
+
+        } else {
+          // Task reminder or other notification — standard routing
+          const screen = extra.screen || 'today';
+          if (typeof showScreen === 'function') showScreen(screen);
+        }
       });
     } catch(e) { console.warn('notif listener error:', e); }
 
@@ -6406,15 +6754,36 @@ async function scheduleAllCapacitorNotifications() {
     }
 
     const notifications = [];
+    // Use IST-aware "now" for skip logic — avoids UTC offset causing missed notifications
     const now = new Date();
+    const istNow = getNowISTDate();
 
     // Schedule for the next 7 days
     for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-      const targetDate = new Date(now);
-      targetDate.setDate(targetDate.getDate() + dayOffset);
-      const dayOfWeek  = targetDate.getDay();
-      const isWeekday  = dayOfWeek >= 1 && dayOfWeek <= 5;
-      const isWeekend  = dayOfWeek === 0 || dayOfWeek === 6;
+      // Build target date in IST space
+      const targetIST = new Date(istNow);
+      targetIST.setDate(targetIST.getDate() + dayOffset);
+      const dayOfWeek = targetIST.getDay();
+      const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
+      const isWeekend = dayOfWeek === 0 || dayOfWeek === 6;
+
+      // Build IST date string for this target day
+      const todayStr = targetIST.getFullYear() + '-' +
+        String(targetIST.getMonth() + 1).padStart(2, '0') + '-' +
+        String(targetIST.getDate()).padStart(2, '0');
+
+      // Helper: convert IST HH:MM on targetIST day to a real UTC Date for scheduling
+      const makeFireAt = (hhmm) => {
+        const [h, m] = hhmm.split(':').map(Number);
+        // Create an IST datetime: year/month/date from targetIST, h:m from setting
+        const istMs = Date.UTC(
+          targetIST.getFullYear(),
+          targetIST.getMonth(),
+          targetIST.getDate(),
+          h, m, 0, 0
+        ) - (5.5 * 60 * 60 * 1000); // subtract IST offset to get UTC
+        return new Date(istMs);
+      };
 
       // ── Task reminders ──
       appData.tasks.forEach((task, tIdx) => {
@@ -6424,12 +6793,10 @@ async function scheduleAllCapacitorNotifications() {
           if (!n.enabled || !n.time || !n.message) return;
           if (!_capShouldFireOnDay(n, dayOfWeek, isWeekday, isWeekend)) return;
 
-          const [h, m] = n.time.split(':').map(Number);
-          const fireAt = new Date(targetDate);
-          fireAt.setHours(h, m, 0, 0);
-          if (fireAt <= now) return; // Skip past times today
+          const fireAt = makeFireAt(n.time);
+          // Only skip past times for TODAY (dayOffset 0); future days always schedule
+          if (dayOffset === 0 && fireAt <= now) return;
 
-          // ID must be a positive integer ≤ 2^31-1
           const id = Math.abs((dayOffset * 9999 + tIdx * 99 + nIdx) % 2000000);
           notifications.push({
             id: id || (dayOffset * 1000 + tIdx * 10 + nIdx + 1),
@@ -6443,13 +6810,14 @@ async function scheduleAllCapacitorNotifications() {
           });
         });
 
-        // Also schedule working window end reminder if set
+        // Working window end reminder
         if (task.workingWindowEnd) {
           const [wh, wm] = task.workingWindowEnd.split(':').map(Number);
-          const warnAt = new Date(targetDate);
-          warnAt.setMinutes(warnAt.getMinutes() - 10); // 10 min warning before window closes
-          warnAt.setHours(wh, wm - 10 < 0 ? wm : wm - 10, 0, 0);
-          if (warnAt > now) {
+          const warnHour  = wm >= 10 ? wh : wh - 1;
+          const warnMin   = wm >= 10 ? wm - 10 : 60 + wm - 10;
+          const warnTime  = String(warnHour < 0 ? 23 : warnHour).padStart(2,'0') + ':' + String(warnMin).padStart(2,'0');
+          const warnAt    = makeFireAt(warnTime);
+          if (!(dayOffset === 0 && warnAt <= now)) {
             const wid = Math.abs((7000000 + dayOffset * 999 + tIdx) % 2100000000);
             notifications.push({
               id: wid || (7000000 + dayOffset * 100 + tIdx),
@@ -6464,74 +6832,124 @@ async function scheduleAllCapacitorNotifications() {
         }
       });
 
-      // ── Ego AI auto-check: pre-scheduled PLACEHOLDER notifications ──
-      // These fire when app is KILLED so user gets an alert even without Gemini running.
-      // When user taps and opens app, the real Gemini response queue is triggered.
-      // When app is foreground: real AI response shown directly in UI (no notification).
-      // When app is background: real AI response fires as native notification instead.
+      // ── Ego AI auto-check notifications ──
       if (appData.settings.autoCoachEnabled) {
-        const totalActiveTasks = (appData.tasks || []).filter(t => t.active !== false).length;
-        const todayStr = targetDate.getFullYear() + '-' + String(targetDate.getMonth()+1).padStart(2,'0') + '-' + String(targetDate.getDate()).padStart(2,'0');
-        const doneTodaySoFar = (appData.history || []).filter(h => h.date === todayStr && h.completed).length;
-        const pendingCount = Math.max(0, totalActiveTasks - doneTodaySoFar);
-
         (appData.settings.autoCoachTimes || []).forEach((entry, idx) => {
           if (!entry.enabled || !entry.time) return;
-          const [h, m] = entry.time.split(':').map(Number);
-          const fireAt = new Date(targetDate);
-          fireAt.setHours(h, m, 0, 0);
-          if (fireAt <= now) return;
+          const fireAt = makeFireAt(entry.time);
+          if (dayOffset === 0 && fireAt <= now) return;
           const id = Math.abs((1000000 + dayOffset * 100 + idx) % 2100000000);
-          const fallbackBody = pendingCount > 0
-            ? `${pendingCount} task${pendingCount > 1 ? 's' : ''} abhi bhi pending ${pendingCount > 1 ? 'hain' : 'hai'}. App kholo — Ego tera full reality check dega!`
-            : `${doneTodaySoFar}/${totalActiveTasks} tasks done. App kholo — Ego tera progress report dega!`;
+          const timeDisp = formatTime12(entry.time);
           notifications.push({
             id: id || (1000000 + dayOffset * 100 + idx + 1),
-            title: '🧠 Ego Check — Aainik',
-            body: fallbackBody,
+            title: '🧠 Ego ne response diya hai!',
+            body: `Ego ne tumhari ${timeDisp} tak ki progress pr response diya hai. "Send me ego\'s response" pr click karo 📊`,
             channelId: 'aainik-ego',
             schedule: { at: fireAt, allowWhileIdle: true },
             smallIcon: 'ic_launcher_foreground',
-            extra: { type: 'ego_check', time: entry.time, screen: 'coach', convType: 'ego_check' }
+            actionTypeId: 'ego_response_action',
+            extra: { type: 'ego_check', time: entry.time, date: todayStr, screen: 'inbox', convType: 'ego_check' }
           });
         });
       }
 
-      // ── Josh auto-reminder: pre-scheduled PLACEHOLDER notifications ──
-      // Same approach as Ego above — placeholder fires when app is killed.
-      if (appData.settings.joshAutoEnabled) {
-        (appData.settings.joshAutoTimes || []).forEach((entry, idx) => {
+      // ── Ego Last 7 Days Report notification ──
+      const s = appData.settings;
+      if (s.last7DaysReportEnabled && s.last7DaysReportTime) {
+        const fireAt = makeFireAt(s.last7DaysReportTime);
+        if (!(dayOffset === 0 && fireAt <= now)) {
+          const id = Math.abs((3000000 + dayOffset * 10) % 2100000000);
+          notifications.push({
+            id: id || (3000000 + dayOffset),
+            title: '📊 Ego: Last 7 Days Report!',
+            body: `ego ne tumhari last 7 days ki progress pr response diya hai. Inbox check karo! 📊`,
+            channelId: 'aainik-ego',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground',
+            actionTypeId: 'ego_response_action',
+            extra: { type: 'last7days', date: todayStr, screen: 'inbox' }
+          });
+        }
+      }
+
+      // ── Ego Overall Progress notification ──
+      if (s.overallProgressEnabled && s.overallProgressTime) {
+        const fireAt = makeFireAt(s.overallProgressTime);
+        if (!(dayOffset === 0 && fireAt <= now)) {
+          const id = Math.abs((3100000 + dayOffset * 10) % 2100000000);
+          notifications.push({
+            id: id || (3100000 + dayOffset),
+            title: '📈 Ego: Overall Progress!',
+            body: `ego ne tumhari overall progress pr response diya hai. Inbox check karo! 📈`,
+            channelId: 'aainik-ego',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground',
+            actionTypeId: 'ego_response_action',
+            extra: { type: 'overall_progress', date: todayStr, screen: 'inbox' }
+          });
+        }
+      }
+
+      // ── Josh auto-reminder notifications ──
+      if (s.joshAutoEnabled) {
+        (s.joshAutoTimes || []).forEach((entry, idx) => {
           if (!entry.enabled || !entry.time) return;
-          const [h, m] = entry.time.split(':').map(Number);
-          const fireAt = new Date(targetDate);
-          fireAt.setHours(h, m, 0, 0);
-          if (fireAt <= now) return;
+          const fireAt = makeFireAt(entry.time);
+          if (dayOffset === 0 && fireAt <= now) return;
           const id = Math.abs((2000000 + dayOffset * 100 + idx) % 2100000000);
-          const upcomingTasks = (appData.tasks || []).filter(t => {
-            if (!t.active) return false;
-            const wStart = t.workingWindowStart || t.scheduledTime || '00:00';
-            return wStart >= entry.time;
-          }).slice(0, 3);
-          const taskNames = upcomingTasks.map(t => t.name).join(', ');
-          const joshFallback = upcomingTasks.length > 0
-            ? `${upcomingTasks.length} task${upcomingTasks.length > 1 ? 's' : ''} aage hain: ${taskNames}. Josh motivational reminder ke saath aa raha hai!`
-            : `App kholo — Josh tera aaj ka ek personalized motivation dega!`;
           notifications.push({
             id: id || (2000000 + dayOffset * 100 + idx + 1),
-            title: '💪 Josh — Task Reminder',
-            body: joshFallback,
+            title: '💪 Josh ne response diya hai!',
+            body: `Josh ne tumhare remaining tasks pr response diya hai. "Send me response" pr click karo 💪`,
             channelId: 'aainik-josh',
             schedule: { at: fireAt, allowWhileIdle: true },
             smallIcon: 'ic_launcher_foreground',
-            extra: { type: 'josh_reminder', time: entry.time, screen: 'coach', convType: 'josh_reminder' }
+            actionTypeId: 'josh_response_action',
+            extra: { type: 'josh_reminder', time: entry.time, date: todayStr, screen: 'inbox', convType: 'josh_reminder' }
           });
         });
+      }
+
+      // ── Josh Last 7 Days Report notification ──
+      if (s.joshLast7DaysEnabled && s.joshLast7DaysTime) {
+        const fireAt = makeFireAt(s.joshLast7DaysTime);
+        if (!(dayOffset === 0 && fireAt <= now)) {
+          const id = Math.abs((3200000 + dayOffset * 10) % 2100000000);
+          notifications.push({
+            id: id || (3200000 + dayOffset),
+            title: '📊 Josh: Last 7 Days!',
+            body: `josh ne tumhari last 7 days ki progress pr response diya hai. Inbox check karo! 📊`,
+            channelId: 'aainik-josh',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground',
+            actionTypeId: 'josh_response_action',
+            extra: { type: 'josh_last7days', date: todayStr, screen: 'inbox' }
+          });
+        }
+      }
+
+      // ── Josh Overall Progress notification ──
+      if (s.joshOverallProgressEnabled && s.joshOverallProgressTime) {
+        const fireAt = makeFireAt(s.joshOverallProgressTime);
+        if (!(dayOffset === 0 && fireAt <= now)) {
+          const id = Math.abs((3300000 + dayOffset * 10) % 2100000000);
+          notifications.push({
+            id: id || (3300000 + dayOffset),
+            title: '📈 Josh: Overall Progress!',
+            body: `josh ne tumhari overall progress pr response diya hai. Inbox check karo! 📈`,
+            channelId: 'aainik-josh',
+            schedule: { at: fireAt, allowWhileIdle: true },
+            smallIcon: 'ic_launcher_foreground',
+            actionTypeId: 'josh_response_action',
+            extra: { type: 'josh_overall', date: todayStr, screen: 'inbox' }
+          });
+        }
       }
     }
 
     if (notifications.length > 0) {
       await LocalNotifications.schedule({ notifications });
-      console.log('Aainik: Scheduled ' + notifications.length + ' native notifications');
+      console.log('Aainik: Scheduled ' + notifications.length + ' native notifications (IST-corrected)');
     } else {
       console.log('Aainik: No notifications to schedule right now');
     }
@@ -6551,4 +6969,690 @@ function _capShouldFireOnDay(n, dayOfWeek, isWeekday, isWeekend) {
   if (r === 'weekends') return isWeekend;
   if (r === 'custom')   return (n.customDays || []).includes(dayOfWeek);
   return true;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   NEW VERSION: INBOX + TELEGRAM DELIVERY SYSTEM
+   
+   API can only be called via 3 methods:
+   1. Notification "Send me response" button  → handleNotifSendEgoResponse / handleNotifSendJoshResponse
+   2. Inbox "Read More" button               → handleReadMoreEgo / handleReadMoreJosh
+   3. Manual chat in Ego/Josh pages          → (existing: talkToCoach, joshManualChat, askScoreQuery)
+═══════════════════════════════════════════════════════════════ */
+
+/* ─────────────────────────────────────────────
+   INBOX ENTRY MANAGEMENT
+───────────────────────────────────────────── */
+
+/**
+ * Add an ego inbox entry for a trigger time.
+ * silent=true → don't re-render (used during batch/init)
+ */
+function addEgoInboxEntry(triggerTime, date, silent) {
+  if (!appData.egoInbox) appData.egoInbox = [];
+  const today = getTodayStr();
+  const d     = date || today;
+
+  // ── Single-day rule: purge any entries not from today ──
+  appData.egoInbox = appData.egoInbox.filter(e => e.date === today);
+
+  const id = 'ego_inbox_' + d + '_' + triggerTime;
+  if (appData.egoInbox.find(e => e.id === id)) return; // already exists
+  appData.egoInbox.unshift({
+    id,
+    triggerTime,
+    date: d,
+    timestamp: Date.now(),
+    response: null,          // null = not fetched yet
+    status: 'pending'        // 'pending' | 'sent_to_telegram' | 'read'
+  });
+  if (appData.egoInbox.length > 50) appData.egoInbox = appData.egoInbox.slice(0, 50);
+  if (!silent) {
+    saveData();
+    if (currentScreen === 'inbox') renderInboxScreen();
+  }
+}
+
+/**
+ * Add a josh inbox entry for a trigger time.
+ */
+function addJoshInboxEntry(triggerTime, date, silent) {
+  if (!appData.joshInbox) appData.joshInbox = [];
+  const today = getTodayStr();
+  const d     = date || today;
+
+  // ── Single-day rule: purge any entries not from today ──
+  appData.joshInbox = appData.joshInbox.filter(e => e.date === today);
+
+  const id = 'josh_inbox_' + d + '_' + triggerTime;
+  if (appData.joshInbox.find(e => e.id === id)) return;
+  appData.joshInbox.unshift({
+    id,
+    triggerTime,
+    date: d,
+    timestamp: Date.now(),
+    response: null,
+    status: 'pending'
+  });
+  if (appData.joshInbox.length > 50) appData.joshInbox = appData.joshInbox.slice(0, 50);
+  if (!silent) {
+    saveData();
+    if (currentScreen === 'inbox') renderInboxScreen();
+  }
+}
+
+/* ─────────────────────────────────────────────
+   NOTIFICATION ACTION HANDLERS
+   Called when user taps "Send me response" button
+───────────────────────────────────────────── */
+
+async function handleNotifSendEgoResponse(triggerTime, date) {
+  const d  = date || getTodayStr();
+  const id = 'ego_inbox_' + d + '_' + triggerTime;
+
+  // Ensure inbox entry exists
+  addEgoInboxEntry(triggerTime, d, true);
+
+  // Block saveData from cancelling pending notifications during this pipeline
+  _suppressNotifReschedule = true;
+  try {
+    // Call API
+    const response = await runEgoResponseForTime(triggerTime, d);
+
+    // Remove from inbox — user clicked "Send me response" so it's handled
+    appData.egoInbox = (appData.egoInbox || []).filter(e => e.id !== id);
+    saveData(); // safe — reschedule suppressed
+
+    // Send to Telegram
+    const timeDisp = formatTime12(triggerTime);
+    const msg = `🧠 *Ego Report — ${timeDisp} (${d})*\n\n${response}`;
+    try {
+      await sendToTelegram(msg);
+      showToast('✅ Ego response Telegram pr send ho gaya!', true);
+    } catch (e) {
+      showToast('⚠️ Telegram send failed: ' + e.message + '\n(Response inbox mein save hai)');
+    }
+
+    if (currentScreen === 'inbox') renderInboxScreen();
+  } finally {
+    // Always re-enable reschedule — do ONE final sync with 5s delay so nearby notifications fire first
+    _suppressNotifReschedule = false;
+    if (typeof window.Capacitor !== 'undefined' && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+      setTimeout(scheduleAllCapacitorNotifications, 5000);
+    }
+  }
+}
+
+async function handleNotifSendJoshResponse(triggerTime, date) {
+  const d  = date || getTodayStr();
+  const id = 'josh_inbox_' + d + '_' + triggerTime;
+
+  addJoshInboxEntry(triggerTime, d, true);
+
+  // Block saveData from cancelling pending notifications during this pipeline
+  _suppressNotifReschedule = true;
+  try {
+    const response = await runJoshResponseForTime(triggerTime, d);
+
+    // Remove from inbox — user clicked "Send me response" so it's handled
+    appData.joshInbox = (appData.joshInbox || []).filter(e => e.id !== id);
+    saveData(); // safe — reschedule suppressed
+
+    const timeDisp = formatTime12(triggerTime);
+    const msg = `💪 *Josh Reminder — ${timeDisp} (${d})*\n\n${response}`;
+    try {
+      await sendToTelegram(msg);
+      showToast('✅ Josh response Telegram pr send ho gaya!', true);
+    } catch (e) {
+      showToast('⚠️ Telegram send failed: ' + e.message + '\n(Response inbox mein save hai)');
+    }
+
+    if (currentScreen === 'inbox') renderInboxScreen();
+  } finally {
+    // Always re-enable reschedule after pipeline
+    _suppressNotifReschedule = false;
+    if (typeof window.Capacitor !== 'undefined' && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+      setTimeout(scheduleAllCapacitorNotifications, 5000);
+    }
+  }
+}
+
+/* ─────────────────────────────────────────────
+   INBOX READ MORE HANDLERS
+   Called when user taps "Read More" in inbox
+───────────────────────────────────────────── */
+
+async function handleReadMoreEgo(inboxId) {
+  const entry = (appData.egoInbox || []).find(e => e.id === inboxId);
+  if (!entry) return;
+
+  // Already have response → show it
+  if (entry.response) {
+    showInboxResponseModal('🧠 Ego Response', entry.response, formatTime12(entry.triggerTime), entry.date);
+    return;
+  }
+
+  // Need to fetch → show loading → call API
+  showInboxLoadingModal('🧠 Ego Response', formatTime12(entry.triggerTime));
+
+  try {
+    const response = await runEgoResponseForTime(entry.triggerTime, entry.date);
+    entry.response = response;
+    entry.status   = 'read';
+    entry.readAt   = Date.now();
+    saveData();
+    closeInboxLoadingModal();
+    showInboxResponseModal('🧠 Ego Response', response, formatTime12(entry.triggerTime), entry.date);
+    if (currentScreen === 'inbox') renderInboxScreen();
+  } catch(e) {
+    closeInboxLoadingModal();
+    showToast('❌ Response load nahi hua: ' + e.message);
+  }
+}
+
+async function handleReadMoreJosh(inboxId) {
+  const entry = (appData.joshInbox || []).find(e => e.id === inboxId);
+  if (!entry) return;
+
+  if (entry.response) {
+    showInboxResponseModal('💪 Josh Response', entry.response, formatTime12(entry.triggerTime), entry.date);
+    return;
+  }
+
+  showInboxLoadingModal('💪 Josh Response', formatTime12(entry.triggerTime));
+
+  try {
+    const response = await runJoshResponseForTime(entry.triggerTime, entry.date);
+    entry.response = response;
+    entry.status   = 'read';
+    entry.readAt   = Date.now();
+    saveData();
+    closeInboxLoadingModal();
+    showInboxResponseModal('💪 Josh Response', response, formatTime12(entry.triggerTime), entry.date);
+    if (currentScreen === 'inbox') renderInboxScreen();
+  } catch(e) {
+    closeInboxLoadingModal();
+    showToast('❌ Response load nahi hua: ' + e.message);
+  }
+}
+
+/* ─────────────────────────────────────────────
+   CORE API CALLERS (Manual trigger only)
+   Extracted from old runAutoCoachReport / runJoshAutoReminder
+───────────────────────────────────────────── */
+
+/**
+ * Call Gemini API for Ego response at a specific trigger time.
+ * Used by both "Send me response" and "Read More".
+ * Returns the full response string.
+ */
+
+// Builds a system prompt where "current time" is triggerTime, not now.
+// Used when replaying/reading an old inbox entry — AI must think it IS that time.
+function buildSystemPromptForSnapshot(snapshotHHMM, snapshotDate) {
+  const s = appData.settings;
+  const personality = s.coachPersonality || 'beast';
+  const base = getActiveCoachPrompt(personality);
+
+  // Override time — critical for honest snapshot response
+  const _istTimeNote = `\n\n🕐 CHECK TIME (SNAPSHOT): ${snapshotHHMM} IST on ${snapshotDate}. You are Tera-Ego giving a reality check as if it is currently ${snapshotHHMM} IST. DO NOT reference events after this time. DO NOT use current real time.`;
+
+  // Score calibration for snapshot time
+  const _expiredAtSnapshot = appData.tasks.filter(t => {
+    if (t.active === false) return false;
+    const winEnd = t.workingWindowEnd || '';
+    return winEnd && winEnd < snapshotHHMM;
+  });
+  const _snapDayNotStarted = _expiredAtSnapshot.length === 0;
+
+  let brutalityNote = '';
+  if (personality === 'beast') {
+    brutalityNote = _snapDayNotStarted
+      ? `\n\n⚠️ SCORE: At ${snapshotHHMM} din abhi shuru tha — koi window expire nahi hui thi. DO NOT roast for zero. Upcoming tasks ke liye energy de.`
+      : `\n\n⚠️ SCORE: Judge based on expired window tasks only. Full honest reality check as per personality.`;
+  } else if (personality === 'balanced') {
+    brutalityNote = `\n\nSCORE: Honest balanced feedback for the ${snapshotHHMM} checkpoint.`;
+  } else {
+    brutalityNote = `\n\nSCORE: Gently honest for the ${snapshotHHMM} checkpoint.`;
+  }
+
+  const lifeGoals  = (s.egoLifeGoals || '').trim();
+  const goalsNote  = lifeGoals ? '\n\n🎯 LIFE GOALS:\n' + lifeGoals : '';
+  const negWords   = (s.egoNegativeWords || '').trim();
+  const negNote    = negWords ? '\n\n💬 LOG KYA KEHTE HAIN:\n' + negWords : '';
+  const taskWhyLines = appData.tasks
+    .filter(t => t.active !== false && t.whyMatters)
+    .map(t => `• ${t.name}: "${t.whyMatters.trim()}"`)
+    .join('\n');
+  const whyNote = taskWhyLines ? '\n\n📋 WHY IT MATTERS:\n' + taskWhyLines : '';
+
+  return base + _istTimeNote + brutalityNote + goalsNote + negNote + whyNote;
+}
+
+async function runEgoResponseForTime(triggerTime, forDate) {
+  if (!hasAnyApiKey()) throw new Error('API key missing! Settings mein set karo.');
+
+  const today = forDate || getTodayStr();
+  const data  = getCoachData();
+  data.report_type = 'auto_check';
+  data.check_time  = triggerTime;
+
+  // ── TIME SNAPSHOT LOGIC ──
+  // Simpler: just compare HH:MM strings for history timestamps on the same date
+  const triggerHHMM = triggerTime; // "HH:MM" — we compare against mark-done time
+
+  const tasksDueByNow = appData.tasks
+    .filter(t => t.active !== false)
+    .filter(t => {
+      // Only tasks whose window STARTED by triggerTime
+      const startTime = t.workingWindowStart || t.scheduledTime || '00:00';
+      return startTime <= triggerHHMM;
+    })
+    .map(t => {
+      // ── SNAPSHOT: get history entry that existed AT triggerTime ──
+      // A task counts as "done at triggerTime" ONLY if it was marked done
+      // before or at triggerTime on that date.
+      const allEntries = appData.history.filter(h => h.taskId === t.id && h.date === today);
+
+      // Get the most recent entry that was created at or before triggerTime
+      // appData.history entries have a `timestamp` (ms). Convert to HH:MM for comparison.
+      const entryAtTrigger = allEntries.find(h => {
+        if (!h.timestamp) return true; // old entries without timestamp — assume they existed
+        // Convert timestamp to IST HH:MM
+        const istOffset = 5.5 * 60;
+        const utc = h.timestamp + (0); // timestamp is already ms since epoch
+        const istDate = new Date(utc + (new Date().getTimezoneOffset() * 60000) + (istOffset * 60000));
+        const entryHHMM = String(istDate.getHours()).padStart(2,'0') + ':' + String(istDate.getMinutes()).padStart(2,'0');
+        // Check if entry was on same date in IST
+        const entryDateStr = istDate.getFullYear() + '-' +
+          String(istDate.getMonth()+1).padStart(2,'0') + '-' +
+          String(istDate.getDate()).padStart(2,'0');
+        if (entryDateStr !== today) return false;
+        return entryHHMM <= triggerHHMM; // only entries marked at or before triggerTime
+      });
+
+      const done = entryAtTrigger && entryAtTrigger.completed;
+      const cat  = appData.categories.find(c => c.id === t.categoryId);
+      const catName    = cat ? cat.name : '';
+      const winStart   = t.workingWindowStart || t.scheduledTime || '00:00';
+      const winEnd     = t.workingWindowEnd   || '23:59';
+
+      // Time-aware classification based on triggerTime (NOT current time)
+      let statusLabel;
+      if (done) {
+        const eff = entryAtTrigger.effortDeclared
+          ? `effort ${entryAtTrigger.effortScore}/10`
+          : 'effort not declared';
+        statusLabel = `✅ DONE (${eff})`;
+      } else if (entryAtTrigger && entryAtTrigger.isUntracked) {
+        statusLabel = `⚠️ UNTRACKED (window closed without marking — 0 score)`;
+      } else if (entryAtTrigger && !entryAtTrigger.completed) {
+        statusLabel = `❌ MISSED (explicitly marked not done before ${triggerHHMM})`;
+      } else if (winEnd > triggerHHMM) {
+        // Window still open AT triggerTime → in progress, not yet judged
+        statusLabel = `⏳ IN PROGRESS at ${triggerHHMM} (window ${winStart}–${winEnd} IST — still open at check time, could still be done)`;
+      } else {
+        // Window closed before triggerTime, no entry → genuine miss
+        statusLabel = `❌ MISSED (window ${winStart}–${winEnd} IST closed before ${triggerHHMM}, no entry)`;
+      }
+
+      // Also note if task was marked done AFTER triggerTime (so AI knows it happened later)
+      const markedAfterTrigger = allEntries.find(h => {
+        if (!h.timestamp || !h.completed) return false;
+        const istOffset = 5.5 * 60;
+        const istDate = new Date(h.timestamp + (new Date().getTimezoneOffset() * 60000) + (istOffset * 60000));
+        const entryHHMM = String(istDate.getHours()).padStart(2,'0') + ':' + String(istDate.getMinutes()).padStart(2,'0');
+        const entryDateStr = istDate.getFullYear() + '-' +
+          String(istDate.getMonth()+1).padStart(2,'0') + '-' +
+          String(istDate.getDate()).padStart(2,'0');
+        return entryDateStr === today && entryHHMM > triggerHHMM;
+      });
+
+      const afterNote = markedAfterTrigger
+        ? ` [NOTE: user marked this done AFTER ${triggerHHMM} — at the time of this check it was not yet done]`
+        : '';
+
+      return {
+        name: t.name, category: catName,
+        scheduledTime: winStart, workingWindowEnd: winEnd,
+        completed: !!done,
+        effortScore: done ? (entryAtTrigger.effortScore || 0) : 0,
+        isUntracked: entryAtTrigger ? !!entryAtTrigger.isUntracked : false,
+        isPending: !done && winEnd > triggerHHMM,
+        isMissed: !done && winEnd <= triggerHHMM && !entryAtTrigger?.isUntracked,
+        whyMatters: t.whyMatters || '',
+        statusLabel: statusLabel + afterNote
+      };
+    });
+
+  const doneCount    = tasksDueByNow.filter(t => t.completed).length;
+  const totalDue     = tasksDueByNow.length;
+  const untrackedNow = tasksDueByNow.filter(t => t.isUntracked).length;
+  const pendingNow   = tasksDueByNow.filter(t => t.isPending).length;
+  const missedNow    = tasksDueByNow.filter(t => t.isMissed).length;
+
+  const expiredForScore = tasksDueByNow.filter(t => !t.isPending);
+  const effectiveScore  = expiredForScore.length > 0
+    ? Math.round((tasksDueByNow.filter(t => t.completed).length / expiredForScore.length) * 100)
+    : null;
+
+  data.tasks_due_by_now = tasksDueByNow;
+  data.due_summary = `At ${triggerHHMM} IST: ${doneCount}/${totalDue} tasks done | In-progress: ${pendingNow} | Missed: ${missedNow} | Untracked: ${untrackedNow}`;
+
+  // ── PASS triggerTime AS "current time" to AI — not actual now ──
+  // This is critical: AI must reason about what was happening AT triggerTime,
+  // not at the time the user tapped "Read More"
+  const snapshotSystemPrompt = buildSystemPromptForSnapshot(triggerHHMM, today);
+
+  const timeContext = `\n\nEGO CHECK TIME: ${triggerHHMM} IST on ${today}
+[NOTE: This response was generated for the ${triggerHHMM} check. Evaluate ONLY what was true at ${triggerHHMM} IST.]
+
+Task status AT ${triggerHHMM} IST (data snapshot — not current state):
+${tasksDueByNow.map(t =>
+  `• [${t.category}] ${t.name} — ${t.statusLabel} | Window: ${t.scheduledTime}→${t.workingWindowEnd} IST | Why: ${t.whyMatters}`
+).join('\n') || 'Koi task due nahi tha is time tak'}
+
+Summary AT ${triggerHHMM}: ${doneCount}/${totalDue} done | In-progress (window still open): ${pendingNow} | Missed (window closed): ${missedNow} | Untracked: ${untrackedNow}
+${effectiveScore !== null ? `Effective score on expired windows at ${triggerHHMM}: ${effectiveScore}%` : `Day had just started at ${triggerHHMM} — no windows expired yet`}
+
+⚠️ CRITICAL INSTRUCTION: You are giving feedback as if it is ${triggerHHMM} IST RIGHT NOW. Do NOT reference anything that happened after ${triggerHHMM}. Tasks marked done after ${triggerHHMM} are shown with [NOTE] — acknowledge those separately at the end if present, as "ye kaam baad mein complete kiya — achha hai."
+
+JUDGING RULES (same as always):
+- ✅ DONE: acknowledge/celebrate
+- ⏳ IN PROGRESS: window still open at ${triggerHHMM} — remind gently, do not condemn
+- ❌ MISSED / ⚠️ UNTRACKED: judge accordingly
+- Tasks with [NOTE: marked done AFTER ${triggerHHMM}]: at end of response, briefly acknowledge these positively`;
+
+  const lastEgoResp = getLastEgoResponse();
+  const lastRespNote = lastEgoResp
+    ? `\n\nMERI LAST RESPONSE (pichli baar jo kaha tha):\n"${lastEgoResp.substring(0, 500)}"\n\nIs context ko use karo.`
+    : '';
+
+  const fullResponse = await callGeminiAPI(
+    snapshotSystemPrompt,
+    timeContext + '\n\n' + JSON.stringify(data) + lastRespNote,
+    800
+  );
+
+  // Save to conversations
+  if (!appData.conversations) appData.conversations = [];
+  appData.conversations.unshift({
+    id: 'conv_auto_' + Date.now(), type: 'auto',
+    triggerTime, date: today, timestamp: Date.now(),
+    scoreLabel: data.due_summary,
+    dataSnapshot: data, response: fullResponse,
+    personality: appData.settings.autoCoachPersonality || 'beast'
+  });
+  if (appData.conversations.length > 30) appData.conversations = appData.conversations.slice(0, 30);
+  saveData();
+
+  return fullResponse;
+}
+
+/**
+ * Call Gemini API for Josh response at a specific trigger time.
+ * Returns the full response string.
+ */
+async function runJoshResponseForTime(triggerTime, forDate) {
+  if (!hasAnyApiKey()) throw new Error('API key missing! Settings mein set karo.');
+
+  const today   = forDate || getTodayStr();
+  const context = buildJoshContextForReminder(triggerTime);
+
+  const systemPrompt = getJoshActivePrompt();
+  const noTasksNote  = context.upcomingTasks.length === 0
+    ? 'Koi upcoming task nahi is time slot mein. User ke life goals aur past performance dekh ke general motivation de.'
+    : '';
+
+  const taskLines = context.upcomingTasks.map(t =>
+    `• [${t.category}] "${t.name}" | Priority: ${t.priority} | Window: ${t.workingWindow}\n  Why: "${t.whyMatters}"`
+  ).join('\n') || 'None pending';
+
+  const _jRISTNow = getNowISTHHMM();
+  const _jRExpired = appData.tasks.filter(t => {
+    if (t.active === false) return false;
+    const winEnd = t.workingWindowEnd || '';
+    return winEnd && winEnd < _jRISTNow;
+  });
+  const _jRDayNotStarted = _jRExpired.length === 0;
+  const _jREffScore = _jRDayNotStarted ? null
+    : Math.round((_jRExpired.filter(t => {
+        const e = appData.history.find(h => h.taskId === t.id && h.date === today);
+        return e && e.completed;
+      }).length / _jRExpired.length) * 100);
+
+  const userContent = `TERA-JOSH REMINDER — Time: ${triggerTime} IST
+🕐 CURRENT IST TIME: ${_jRISTNow} IST (UTC+5:30) — use IST only, never UTC.
+
+UPCOMING PENDING TASKS:
+${taskLines}
+
+TODAY'S SCORE SO FAR: ${_jRDayNotStarted
+  ? `0% — BUT din abhi shuru hua hai, koi window expire nahi hui. 0% is NOT a failure here. Focus on upcoming tasks.`
+  : `${_jREffScore}% on expired windows — ${context.daily.done}/${context.daily.taskCount} total done`}
+
+⚠️ JUDGING RULES: Only judge tasks whose working window has already CLOSED. Tasks with open windows = still can be done, just remind/motivate.
+
+LIFE GOALS: ${context.lifeGoals || 'Not set'}
+NEGATIVE WORDS: ${context.negativeWords || 'Not set'}
+
+${noTasksNote}
+
+Format:
+Line 1: Ek punchy motivational headline (max 90 chars, Hinglish)
+Blank line
+Full detailed reminder + motivation`;
+
+  const lastJoshResp = getLastJoshResponse();
+  const lastJoshNote = lastJoshResp
+    ? `\n\nMERI LAST RESPONSE (jo maine pichli baar kahi thi):\n"${lastJoshResp.substring(0, 500)}"\n\nIs context ko use karo — kya user ne progress ki?`
+    : '';
+
+  const fullResponse = await callGeminiAPI(systemPrompt, userContent + lastJoshNote, 600);
+
+  // Save to joshConversations
+  if (!appData.joshConversations) appData.joshConversations = [];
+  appData.joshConversations.unshift({
+    id:         'jc_auto_' + Date.now(),
+    type:       'auto_reminder',
+    triggerTime,
+    date:       today,
+    timestamp:  Date.now(),
+    scoreLabel: `💪 Tera-Josh Auto — ${context.totalUpcoming} tasks | ${formatTime12(triggerTime)}`,
+    response:   fullResponse
+  });
+  if (appData.joshConversations.length > 30) appData.joshConversations = appData.joshConversations.slice(0, 30);
+  saveData();
+
+  return fullResponse;
+}
+
+/* ─────────────────────────────────────────────
+   TELEGRAM DELIVERY
+───────────────────────────────────────────── */
+
+async function sendToTelegram(text) {
+  const token  = (appData.settings.telegramBotToken || '').trim();
+  const chatId = (appData.settings.telegramChatId   || '').trim();
+
+  if (!token || !chatId) {
+    throw new Error('Telegram bot token ya chat ID set nahi hai. Settings mein set karo.');
+  }
+
+  const url = `https://api.telegram.org/bot${token}/sendMessage`;
+  const res  = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      chat_id:    chatId,
+      text:       text,
+      parse_mode: 'Markdown'
+    })
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text().catch(() => '');
+    throw new Error(`Telegram API error ${res.status}: ${errBody.substring(0, 100)}`);
+  }
+  return true;
+}
+
+/* ─────────────────────────────────────────────
+   INBOX RENDER FUNCTIONS
+───────────────────────────────────────────── */
+
+function renderEgoInbox() {
+  const container = document.getElementById('ego-inbox-list');
+  if (!container) return;
+
+  const inbox = (appData.egoInbox || []);
+  if (inbox.length === 0) {
+    container.innerHTML = `<div class="inbox-empty">
+      <div class="inbox-empty-icon">📭</div>
+      <div class="inbox-empty-text">Abhi koi missed response nahi hai.<br>Auto check times pe notifications aayenge.</div>
+    </div>`;
+    return;
+  }
+
+  container.innerHTML = inbox.map(entry => {
+    const timeDisp = formatTime12(entry.triggerTime);
+    const dateDisp = entry.date || '';
+
+    let statusText, statusClass, actionBtn;
+
+    if (entry.status === 'sent_to_telegram') {
+      statusText  = '✅ Response Telegram pr bheja ja chuka hai';
+      statusClass = 'inbox-status-sent';
+      actionBtn   = `<button class="btn-inbox-readmore" onclick="handleReadMoreEgo('${entry.id}')">🔍 Phir Se Dekho</button>`;
+    } else if (entry.status === 'read') {
+      statusText  = '👁️ Response dekha ja chuka hai';
+      statusClass = 'inbox-status-read';
+      actionBtn   = `<button class="btn-inbox-readmore" onclick="handleReadMoreEgo('${entry.id}')">🔍 Phir Se Dekho</button>`;
+    } else {
+      statusText  = `Ego ne tumhari ${timeDisp} tak ki progress pr response diya tha, full response dekhne ke liye "Read More" pr click karo`;
+      statusClass = 'inbox-status-pending';
+      actionBtn   = `<button class="btn-inbox-readmore" onclick="handleReadMoreEgo('${entry.id}')">📖 Read More</button>`;
+    }
+
+    return `
+      <div class="inbox-card ${statusClass}">
+        <div class="inbox-card-header">
+          <span class="inbox-time">🧠 ${timeDisp}</span>
+          <span class="inbox-date">${dateDisp}</span>
+        </div>
+        <div class="inbox-card-text">${statusText}</div>
+        <div class="inbox-card-actions">${actionBtn}</div>
+      </div>`;
+  }).join('');
+}
+
+function renderJoshInbox() {
+  const container = document.getElementById('josh-inbox-list');
+  if (!container) return;
+
+  const inbox = (appData.joshInbox || []);
+  if (inbox.length === 0) {
+    container.innerHTML = `<div class="inbox-empty">
+      <div class="inbox-empty-icon">📭</div>
+      <div class="inbox-empty-text">Abhi koi missed response nahi hai.<br>Auto reminder times pe notifications aayenge.</div>
+    </div>`;
+    return;
+  }
+
+  container.innerHTML = inbox.map(entry => {
+    const timeDisp = formatTime12(entry.triggerTime);
+    const dateDisp = entry.date || '';
+
+    let statusText, statusClass, actionBtn;
+
+    if (entry.status === 'sent_to_telegram') {
+      statusText  = '✅ Response Telegram pr bheja ja chuka hai';
+      statusClass = 'inbox-status-sent';
+      actionBtn   = `<button class="btn-inbox-readmore" onclick="handleReadMoreJosh('${entry.id}')">🔍 Phir Se Dekho</button>`;
+    } else if (entry.status === 'read') {
+      statusText  = '👁️ Response dekha ja chuka hai';
+      statusClass = 'inbox-status-read';
+      actionBtn   = `<button class="btn-inbox-readmore" onclick="handleReadMoreJosh('${entry.id}')">🔍 Phir Se Dekho</button>`;
+    } else {
+      statusText  = `Josh ne tumhare ${timeDisp} ke remaining tasks pr response diya tha, full response dekhne ke liye "Read More" pr click karo`;
+      statusClass = 'inbox-status-pending';
+      actionBtn   = `<button class="btn-inbox-readmore" onclick="handleReadMoreJosh('${entry.id}')">📖 Read More</button>`;
+    }
+
+    return `
+      <div class="inbox-card ${statusClass}">
+        <div class="inbox-card-header">
+          <span class="inbox-time">💪 ${timeDisp}</span>
+          <span class="inbox-date">${dateDisp}</span>
+        </div>
+        <div class="inbox-card-text">${statusText}</div>
+        <div class="inbox-card-actions">${actionBtn}</div>
+      </div>`;
+  }).join('');
+}
+
+/* ─────────────────────────────────────────────
+   INBOX RESPONSE MODAL HELPERS
+───────────────────────────────────────────── */
+
+function showInboxLoadingModal(title, timeDisp) {
+  let modal = document.getElementById('modal-inbox-response');
+  if (!modal) return;
+  document.getElementById('inbox-modal-title').textContent = title;
+  document.getElementById('inbox-modal-time').textContent  = timeDisp;
+  document.getElementById('inbox-modal-body').innerHTML    =
+    `<div class="inbox-loading-line-wrap">
+       <div class="inbox-loading-line"></div>
+       <div style="margin-top:12px;color:var(--text-secondary);font-size:13px;">Response load ho raha hai...</div>
+     </div>`;
+  openModal('modal-inbox-response');
+}
+
+function closeInboxLoadingModal() {
+  // Modal stays open — caller will update body with actual response
+}
+
+function showInboxResponseModal(title, response, timeDisp, date) {
+  let modal = document.getElementById('modal-inbox-response');
+  if (!modal) {
+    // Fallback: show in toast if modal doesn't exist
+    showToast(response.substring(0, 100) + '...');
+    return;
+  }
+  document.getElementById('inbox-modal-title').textContent = title;
+  document.getElementById('inbox-modal-time').textContent  = `${timeDisp} — ${date || ''}`;
+  document.getElementById('inbox-modal-body').innerHTML    =
+    `<div class="inbox-response-text">${escapeHtml(response)}</div>`;
+  openModal('modal-inbox-response');
+}
+
+/* ─────────────────────────────────────────────
+   TELEGRAM SETTINGS
+───────────────────────────────────────────── */
+
+function renderTelegramSettings() {
+  const s = appData.settings;
+  const tokenInp  = document.getElementById('telegram-bot-token');
+  const chatInp   = document.getElementById('telegram-chat-id');
+  if (tokenInp) tokenInp.value = s.telegramBotToken || '';
+  if (chatInp)  chatInp.value  = s.telegramChatId   || '';
+}
+
+function saveTelegramToken(val) {
+  appData.settings.telegramBotToken = (val || '').trim();
+  saveData();
+}
+
+function saveTelegramChatId(val) {
+  appData.settings.telegramChatId = (val || '').trim();
+  saveData();
+}
+
+async function testTelegramConnection() {
+  try {
+    await sendToTelegram('🧪 *Aainik Test Message*\n\nTelegram connection sahi kaam kar raha hai! ✅\n\nEgo aur Josh responses ab directly yahan aayenge.');
+    showToast('✅ Telegram test message sent!');
+  } catch(e) {
+    showToast('❌ Telegram test failed: ' + e.message);
+  }
 }
